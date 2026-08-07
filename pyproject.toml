@@ -1,0 +1,68 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "whisperlocal"
+dynamic = ["version"]
+description = "Push-to-talk dictation for macOS. Hold a key, speak, and your words appear at the cursor — transcribed locally on Apple Silicon."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "Shivam Dixit" }]
+maintainers = [{ name = "Shivam Dixit" }]
+keywords = [
+    "whisper",
+    "dictation",
+    "speech-to-text",
+    "macos",
+    "apple-silicon",
+    "mlx",
+    "push-to-talk",
+    "offline",
+    "privacy",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: MacOS X :: Cocoa",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Utilities",
+]
+
+dependencies = [
+    "mlx-whisper>=0.4.3",
+    "pynput>=1.8",
+    "sounddevice>=0.4",
+    "soundfile>=0.12",
+    "pyperclip>=1.9",
+    "rumps>=0.4",
+    "pyobjc-framework-Cocoa>=10",
+    "pyobjc-framework-ApplicationServices>=10",
+    "numpy>=2",
+]
+
+[project.urls]
+Homepage = "https://github.com/shivamdixit17/whisperlocal"
+Repository = "https://github.com/shivamdixit17/whisperlocal"
+Issues = "https://github.com/shivamdixit17/whisperlocal/issues"
+Changelog = "https://github.com/shivamdixit17/whisperlocal/blob/main/CHANGELOG.md"
+
+[project.scripts]
+whisperlocal = "whisperlocal.cli:main"
+
+[tool.hatch.version]
+path = "src/whisperlocal/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/whisperlocal"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/whisperlocal", "README.md", "LICENSE", "CHANGELOG.md"]
