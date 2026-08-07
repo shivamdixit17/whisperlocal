@@ -3,6 +3,30 @@
 All notable changes to WhisperLocal are recorded here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.2.1] — 2026-08-07
+
+### Fixed
+
+- **It was using about 1.6 GB of memory.** Almost none of that was the model,
+  which is ~140 MB. MLX keeps freed GPU buffers in a cache to reuse them, and
+  unbounded that reached ~950 MB after a few dictations and was never returned —
+  absurd for something that idles in the menu bar all day.
+
+  The cache is now capped (`mlx_cache_mb`, default 128 MB) and dropped entirely
+  after a minute without dictation (`idle_release_seconds`). Idle footprint goes
+  from ~1.6 GB to ~430 MB; a dictation costs about 35 ms more.
+
+  Measured with whisper-base, five transcriptions each:
+
+  | `mlx_cache_mb` | median | footprint |
+  |---|---:|---:|
+  | unlimited (old) | 230 ms | 1423 MB |
+  | 128 (new default) | 265 ms | 660 MB |
+  | 64 | 298 ms | 556 MB |
+  | 0 | 364 ms | 491 MB |
+
+- `whisperlocal doctor` now reports the running app's actual memory use.
+
 ## [1.2.0] — 2026-08-07
 
 It installs as a real Mac app now, and the recording dot follows your text
@@ -157,6 +181,7 @@ fixes below.
 - **Switching models could raise a `RuntimeError`** by renaming menu items while
   iterating the menu keyed by those names.
 
+[1.2.1]: https://github.com/shivamdixit17/whisperlocal/releases/tag/v1.2.1
 [1.2.0]: https://github.com/shivamdixit17/whisperlocal/releases/tag/v1.2.0
 [1.1.0]: https://github.com/shivamdixit17/whisperlocal/releases/tag/v1.1.0
 [1.0.0]: https://github.com/shivamdixit17/whisperlocal/releases/tag/v1.0.0

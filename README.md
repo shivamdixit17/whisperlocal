@@ -232,6 +232,8 @@ whisperlocal config --init && open ~/.config/whisperlocal/config.toml
 | `language` | `"en"` | Language code, or `"auto"` |
 | `fp16` | `false` | Half precision |
 | `paste_mode` | `"paste"` | `"paste"` presses ⌘V; `"clipboard"` only copies |
+| `mlx_cache_mb` | `128` | Cap on MLX's GPU buffer cache — see [Memory](#memory) |
+| `idle_release_seconds` | `60` | Drop that cache after this long without dictation |
 | `sounds` | `true` | System sounds for each state |
 | `overlay` | `true` | The floating dot |
 | `overlay_anchor` | `"caret"` | `"caret"`, `"mouse"` or `"bottom"` — see below |
@@ -249,6 +251,47 @@ WHISPERLOCAL_MODEL=small WHISPERLOCAL_TRIGGER_KEYS=fn,f13 whisperlocal
 ```
 
 **Precedence:** defaults → `~/.config/whisperlocal/config.toml` → environment variables → command-line flags.
+
+## Memory
+
+WhisperLocal sits in your menu bar all day, so it should not hoard memory.
+
+| | |
+|---|---|
+| Just started | ~150 MB |
+| Idle, after use | ~430 MB |
+| Mid-dictation | ~660 MB |
+
+Most of that is not the model — the Whisper weights are about 140 MB. The rest
+is Python, MLX, and MLX's **buffer cache**: freed GPU memory it keeps for reuse
+rather than handing back. Left alone that cache grows to roughly a gigabyte
+after a few dictations and stays there, which is where the old ~1.6 GB figure
+came from.
+
+Two settings keep it in check, and you can trade memory against speed:
+
+```toml
+mlx_cache_mb = 128          # cap the cache; 0 disables it, -1 for no limit
+idle_release_seconds = 60   # drop it entirely after this long idle
+```
+
+Measured with `whisper-base`, five transcriptions each, on an M-series Mac:
+
+| `mlx_cache_mb` | Median transcription | Total footprint |
+|---|---:|---:|
+| `-1` (unlimited) | 230 ms | 1423 MB |
+| `128` **(default)** | 265 ms | 660 MB |
+| `64` | 298 ms | 556 MB |
+| `0` | 364 ms | 491 MB |
+
+The default keeps a burst of dictation fast, then releases the cache once you
+stop, so the idle app settles near the floor. Want it smaller still? Drop
+`mlx_cache_mb` to `0`. Want every millisecond? Set it to `-1`.
+
+> **Changing the model barely moves this.** `tiny` saves about 70 MB against
+> `base` and is noticeably less accurate. The cache is the thing worth tuning.
+
+`whisperlocal doctor` prints the current figure.
 
 ## The recording dot
 

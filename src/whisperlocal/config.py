@@ -131,6 +131,28 @@ class Settings:
     language: str = "en"
     fp16: bool = False
 
+    # ── Memory ───────────────────────────────────────────────────────────────
+    # MLX keeps freed GPU buffers in a cache so it can reuse them instead of
+    # asking the system for new ones. Left alone it grows to roughly a gigabyte
+    # after a few dictations and never gives it back, which is absurd for
+    # something that sits idle in the menu bar all day. Measured on an M-series
+    # Mac with whisper-base, five transcriptions each:
+    #
+    #     cache limit   median      total footprint
+    #     unlimited     230 ms      1423 MB
+    #     128 MB        265 ms       660 MB
+    #      64 MB        298 ms       556 MB
+    #       0 MB        364 ms       491 MB
+    #
+    # 128 MB is the sweet spot: most of the speed, less than half the memory.
+    # Set to 0 to disable the cache entirely, or -1 to let MLX do as it pleases.
+    mlx_cache_mb: int = 128
+
+    # Seconds of no dictation before the cache is dropped altogether. This is
+    # what keeps the idle footprint near the floor while a burst of dictation
+    # still gets a warm cache. 0 disables the release.
+    idle_release_seconds: int = 60
+
     # ── Audio ────────────────────────────────────────────────────────────────
     # Fallback only. Recording actually runs at the input device's native rate,
     # because asking PortAudio for a rate the hardware does not run at pushes it
@@ -394,6 +416,10 @@ def validate(settings: Settings) -> None:
         )
     if settings.sample_rate <= 0:
         raise ConfigError("sample_rate: must be greater than zero")
+    if settings.mlx_cache_mb < -1:
+        raise ConfigError("mlx_cache_mb: must be -1 (unlimited), 0, or more")
+    if settings.idle_release_seconds < 0:
+        raise ConfigError("idle_release_seconds: must be zero or more")
     if settings.max_word_run < 2:
         raise ConfigError("max_word_run: must be 2 or more")
     if not 0 < settings.max_repeat_ratio <= 1:
@@ -535,6 +561,27 @@ language = "en"
 # Half precision. Off by default because that is the configuration this has
 # been used and tuned against; turning it on is usually faster.
 fp16 = false
+
+# ─── Memory ─────────────────────────────────────────────────────────────────
+# MLX keeps freed GPU buffers around to reuse. Left alone that grows to about a
+# gigabyte after a few dictations and is never returned — silly for something
+# that sits in the menu bar all day. The model itself is only ~140 MB of it.
+#
+# Measured with whisper-base, five transcriptions each:
+#
+#     cache limit   median      total footprint
+#     unlimited     230 ms      1423 MB
+#     128 MB        265 ms       660 MB
+#      64 MB        298 ms       556 MB
+#       0 MB        364 ms       491 MB
+#
+# 0 disables the cache; -1 lets MLX do whatever it likes.
+mlx_cache_mb = 128
+
+# Seconds without dictation before the cache is dropped completely, so a burst
+# of dictation stays fast but an idle app is not holding memory it is not
+# using. 0 turns the release off.
+idle_release_seconds = 60
 
 # ─── Behaviour ──────────────────────────────────────────────────────────────
 # "paste"     — copy and press Cmd+V for you (needs Accessibility permission)

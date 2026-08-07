@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import platform
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -151,6 +152,36 @@ def _check_model_cached(settings: cfg.Settings) -> tuple[bool, str]:
     )
 
 
+def _check_memory(settings: cfg.Settings) -> tuple[bool, str] | None:
+    """
+    Report what the running app is actually using.
+
+    macOS reports "memory" as phys_footprint, which is what Activity Monitor
+    shows and is far larger than the resident size — most of an idle app's
+    footprint is compressed rather than resident.
+    """
+    from whisperlocal import appbundle
+
+    pids = appbundle._pids_matching(appbundle.APP_PROCESS_PATTERN)
+    if not pids:
+        return None
+
+    try:
+        out = subprocess.run(
+            ["footprint", "-p", str(pids[0])], capture_output=True, text=True, timeout=30
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    for line in out.splitlines():
+        if "phys_footprint:" in line and "peak" not in line:
+            used = line.split(":", 1)[1].strip()
+            limit = settings.mlx_cache_mb
+            note = "no cache limit" if limit < 0 else f"cache capped at {limit} MB"
+            return True, f"memory: {used} ({note})"
+    return None
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Run every check and summarize what, if anything, needs fixing."""
     print(f"WhisperLocal {__version__} — checking your setup\n")
@@ -183,7 +214,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         failures += 0 if ok else 1
 
     # Soft checks — degraded but usable.
-    for ok, message in (_check_accessibility(), _check_model_cached(settings)):
+    soft = [_check_accessibility(), _check_model_cached(settings)]
+    memory = _check_memory(settings)
+    if memory:
+        soft.append(memory)
+    for ok, message in soft:
         print(f"[{OK if ok else WARN}] {message}")
 
     if settings.history_enabled:
