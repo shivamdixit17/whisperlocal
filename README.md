@@ -29,7 +29,7 @@ macOS permissions to grant.
 
 Piping a script from the internet straight into your shell means running code
 you have not read. If that makes you uneasy — it reasonably might — do it in
-two steps instead:
+two steps:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shivamdixit17/whisperlocal/main/install.sh -o install.sh
@@ -50,23 +50,25 @@ uv tool install git+https://github.com/shivamdixit17/whisperlocal.git
 
 ## What it does
 
-Hold **Right Option (⌥)** for a second. A red indicator appears. Speak. Let go.
-A moment later your words are typed in at the cursor — in your editor, your
-browser, Slack, a terminal, anywhere text goes.
+Hold the **Fn (globe)** key. Speak. Let go. A moment later your words are typed
+in at the cursor — in your editor, your browser, Slack, a terminal, anywhere
+text goes.
 
 ```mermaid
 stateDiagram-v2
     direction LR
     [*] --> Idle
-    Idle --> Waiting: hold ⌥
-    Waiting --> Idle: released too soon
-    Waiting --> Recording: held 1s 🔴
-    Recording --> Transcribing: release ⌥
-    Transcribing --> Idle: text pasted ✅
+    Idle --> Waiting: hold trigger
+    Waiting --> Idle: released early
+    Waiting --> Recording: threshold met
+    Recording --> Transcribing: release
+    Transcribing --> Idle: pasted
+    Transcribing --> Idle: discarded as loop
 ```
 
-The hold threshold is the whole trick: a quick tap on the key does nothing, so
-the microphone never opens by accident.
+By default there is no arming delay — recording starts the instant the key goes
+down, so you can talk straight away. Stray taps are thrown out afterwards by
+`min_recording_duration`, so nothing gets pasted from a brush of the key.
 
 ## Why this instead of the built-in dictation
 
@@ -75,91 +77,117 @@ the microphone never opens by accident.
 | Where audio goes | Never leaves your Mac | May be sent to Apple for server-based dictation |
 | Model | Whisper, your choice of size | Fixed |
 | Works offline | Always | Only with on-device dictation enabled |
-| Trigger | Any key you pick, push-to-talk | Fixed shortcut, toggle-style |
+| Trigger | Any key you pick, including Fn and mouse buttons | Fixed shortcut, toggle-style |
 | Punctuation | Inferred by Whisper | You often speak it aloud |
-| Cost | Free, MIT | Free |
+| Garbled output | Detected and discarded | Pasted anyway |
+| Your own stats | `whisperlocal stats` | None |
 
 ## Features
 
 - **Push-to-talk** — hold to record, release to transcribe. No toggle to forget about.
-- **Runs on the GPU** — [MLX](https://github.com/ml-explore/mlx), Apple's own framework, so the Neural Engine and GPU do the work.
+- **Trigger on almost anything** — the Fn/globe key, right-hand modifiers, F13–F19, or a mouse button. List several and any of them works.
+- **Runs on the GPU** — [MLX](https://github.com/ml-explore/mlx), Apple's own framework.
 - **Genuinely offline** — after the model downloads once, it never touches the network again.
-- **Pastes anywhere** — it writes into whatever app has focus.
-- **Menu bar app** — live status, model switcher, on/off toggle.
-- **On-screen indicator** — a floating HUD so you always know if the mic is open.
-- **Audio cues** — distinct sounds for start, stop, done and failed.
-- **Five models** — from 74 MB and instant to 1.6 GB and excellent.
+- **Hallucination guard** — Whisper loops on short or noisy audio and emits one word hundreds of times. That output is detected and thrown away instead of dumped into whatever you had focused.
+- **Pastes anywhere** — straight into the app you were in when you started talking.
+- **Menu bar app** — SF Symbol status icon, last transcription, on/off toggle.
+- **A single quiet dot** near the bottom of the screen: red breathing while recording, amber while transcribing.
+- **Your own dictation stats** — `whisperlocal stats` shows words, speaking rate, transcription latency, failure rates, which apps you dictate into and words per day.
 - **`whisperlocal doctor`** — tells you exactly what is misconfigured instead of failing silently.
 
 ## Requirements
 
-- **Apple Silicon Mac** (M1 or newer). MLX does not run on Intel Macs — WhisperLocal will tell you so rather than crashing.
+- **Apple Silicon Mac** (M1 or newer). MLX does not run on Intel Macs — WhisperLocal says so rather than crashing.
 - **macOS 13+**
 - **Python 3.11+** — the installer handles this for you via uv
-- **~1 GB of disk** for dependencies, plus the model you choose (see below)
+- **~1 GB of disk** for dependencies, plus the model you choose
 
 > The dependency footprint is large because `mlx-whisper` pulls in PyTorch for
 > its tokenizer. That is upstream, not something this project adds.
 
 ## Usage
 
-Start it:
-
 ```bash
 whisperlocal
 ```
 
-A 🎙️ appears in your menu bar. Then:
-
-1. **Hold Right Option (⌥)** for one second — a chime, and a red 🔴 indicator appears
-2. **Speak**
-3. **Release** — a pop, and the indicator switches to ⚙️
-4. **Your text appears at the cursor** — a final chime confirms it
-
-### Menu bar
-
-| Item | What it does |
-|---|---|
-| **Status** | What the app is doing right now |
-| **Last: …** | Click to copy your last transcription again |
-| **Enabled ✅ / ❌** | Suspend dictation without quitting |
-| **Model ▸** | Switch model on the fly |
-| **Quit** | Exit |
+An icon appears in your menu bar. Then hold your trigger, speak, and release.
 
 ### Command line
 
 ```bash
-whisperlocal                      # start the menu bar app
-whisperlocal doctor               # check your setup, diagnose problems
-whisperlocal config --init        # create a config file
-whisperlocal config --show        # show the settings actually in effect
-whisperlocal --model small        # override the model for one run
-whisperlocal --language de        # override the language for one run
+whisperlocal                        # start the menu bar app
+whisperlocal doctor                 # check your setup, diagnose problems
+whisperlocal stats                  # summarise your dictation history
+whisperlocal stats --days 7         # ...for the last week
+whisperlocal config --init          # create a config file
+whisperlocal config --show          # show the settings actually in effect
+whisperlocal --trigger fn,f13       # override triggers for one run
+whisperlocal --model small          # override the model for one run
 ```
+
+## Trigger keys
+
+Set `trigger_keys` to any combination. Holding **any one** of them dictates, and
+whichever you press first owns the recording until you let go — so pressing a
+second trigger mid-sentence will not cut you off.
+
+```toml
+trigger_keys = ["fn", "f13", "mouse_middle"]
+```
+
+| Value | Notes |
+|---|---|
+| `fn` | **Default.** The globe key. Watched through a Quartz event tap, because Fn is not a keycode at all — it is only a modifier flag bit, and pynput cannot see it |
+| `alt_r` `shift_r` | Right-hand modifiers. Safe: rarely pressed alone |
+| `f13`–`f19` | Most keyboards never send these. If you have a programmable keyboard, mapping a spare key to F13 makes an excellent dedicated dictation button |
+| `alt_l` `cmd_r` `ctrl_r` | Work, but these are used by ordinary shortcuts — holding one during a shortcut starts a recording |
+| `mouse_left` `mouse_right` `mouse_middle` | Dictate from the mouse when you are not near the keyboard. Read the section below first |
+
+Fn, ordinary keys and mouse buttons use three different mechanisms, and all
+three listeners run together, so mixing them is fine.
+
+### Dictating from the mouse
+
+Useful when you are away from the keyboard. It needs care, because holding the
+left button is also what every drag, text selection, window move and slider
+does. Two settings make it workable:
+
+```toml
+trigger_keys = ["fn", "mouse_left"]
+mouse_hold_threshold = 1.0    # mouse buttons only; hold_threshold is often 0
+mouse_drag_cancel_px = 10     # a press that travels this far is a drag
+```
+
+- **`mouse_hold_threshold`** is separate from `hold_threshold` on purpose. The key threshold defaults to `0.0`, which is right for a key you never otherwise press but would make every single click record. Mouse buttons must be held for a full second, and values below `0.3` are rejected.
+- **`mouse_drag_cancel_px`** is what actually makes the left button usable. If the pointer travels more than this from where it went down, the press is a drag and the trigger is cancelled. Selecting text moves well past 10 px within a second; a hand holding still to talk does not.
+- The drag guard only applies **before** recording starts. Once you are recording, move the mouse wherever you like — you are clearly dictating on purpose by then.
+
+Even so, a long press held still on a button or a folder can start a recording.
+`mouse_right` or `mouse_middle` avoid nearly all of this and are the better
+choice if they are free on your mouse.
 
 ## Permissions
 
 macOS grants these to **the app that launches WhisperLocal** — your terminal —
-not to WhisperLocal itself. This is how macOS works for any tool like this, and
-it is worth knowing so the settings screen makes sense.
+not to WhisperLocal itself. This is how macOS works for any tool like this.
 
 Open **System Settings → Privacy & Security** and add your terminal to:
 
 | Permission | Why it is needed | Without it |
 |---|---|---|
-| **Accessibility** | To press ⌘V for you | Text is copied to your clipboard; you paste it |
+| **Input Monitoring** | To see the trigger while another app is focused, and to create the Fn event tap | The trigger never fires |
 | **Microphone** | To hear you | Nothing records |
-| **Input Monitoring** | To see the trigger key while another app is focused | The hotkey never fires |
+| **Accessibility** | To press ⌘V for you | Text is copied to your clipboard; you paste it |
 
-Quit and reopen your terminal afterwards. Then run `whisperlocal doctor` to
-confirm.
+Quit and reopen your terminal afterwards, then run `whisperlocal doctor`.
 
-> Don't want to grant Accessibility? Set `paste_mode = "clipboard"` in your
-> config. WhisperLocal will copy transcriptions and let you paste them yourself.
+> Don't want to grant Accessibility? Set `paste_mode = "clipboard"`.
+> WhisperLocal will copy transcriptions and let you paste them yourself.
 
 ## Configuration
 
-Everything is optional — the defaults work. To customize:
+Everything is optional — the defaults work.
 
 ```bash
 whisperlocal config --init && open ~/.config/whisperlocal/config.toml
@@ -167,34 +195,30 @@ whisperlocal config --init && open ~/.config/whisperlocal/config.toml
 
 | Setting | Default | What it does |
 |---|---|---|
-| `trigger_key` | `"alt_r"` | The push-to-talk key. See the list below. |
-| `hold_threshold` | `1.0` | Seconds to hold before recording starts. `0` for instant. |
-| `min_recording_duration` | `0.5` | Recordings shorter than this are discarded as noise. |
-| `model` | `"base"` | Which Whisper model to use. |
-| `language` | `"en"` | Language code, or `"auto"` to detect it. |
-| `fp16` | `true` | Half precision. Faster on Apple Silicon. |
-| `sample_rate` | `16000` | Whisper is trained at 16 kHz; rarely worth changing. |
-| `paste_mode` | `"paste"` | `"paste"` presses ⌘V for you; `"clipboard"` only copies. |
-| `sounds` | `true` | System sounds for each state. |
-| `overlay` | `true` | The floating on-screen indicator. |
+| `trigger_keys` | `["fn"]` | Hold any of these to dictate |
+| `hold_threshold` | `0.0` | Seconds to hold before recording. `0` starts immediately |
+| `mouse_hold_threshold` | `1.0` | Same, for mouse buttons. Minimum `0.3` |
+| `mouse_drag_cancel_px` | `10` | A press travelling further than this is a drag, not dictation |
+| `min_recording_duration` | `0.5` | Shorter recordings are discarded as noise |
+| `model` | `"base"` | Short name, or any Hugging Face repo id |
+| `language` | `"en"` | Language code, or `"auto"` |
+| `fp16` | `false` | Half precision |
+| `paste_mode` | `"paste"` | `"paste"` presses ⌘V; `"clipboard"` only copies |
+| `sounds` | `true` | System sounds for each state |
+| `overlay` | `true` | The floating dot |
+| `history_enabled` | `true` | Record dictations for `whisperlocal stats` |
+| `history_text` | `true` | Store the words themselves, not just the statistics |
+| `max_word_run` | `4` | Longest allowed run of one repeated word before output is judged a loop |
+| `max_repeat_ratio` | `0.30` | Below this unique-word ratio, output is judged a loop |
+| `icon_color` | `[1.0, 0.58, 0.0]` | Menu bar glyph colour; `[]` for a monochrome template icon |
 
-Every setting also works as an environment variable, which is handy for trying
-something once:
+Every setting also works as an environment variable:
 
 ```bash
-WHISPERLOCAL_MODEL=small WHISPERLOCAL_LANGUAGE=auto whisperlocal
+WHISPERLOCAL_MODEL=small WHISPERLOCAL_TRIGGER_KEYS=fn,f13 whisperlocal
 ```
 
-**Precedence:** built-in defaults → `~/.config/whisperlocal/config.toml` → environment variables → command-line flags.
-
-### Trigger keys
-
-`alt_r` · `alt_l` · `cmd_r` · `ctrl_r` · `shift_r` · `f13`–`f19`
-
-Only keys that are safe to hold down are offered: right-hand modifiers you
-rarely press alone, and the F13–F19 block most keyboards never send. If you
-have a programmable keyboard, mapping a spare key to F13 makes an excellent
-dedicated dictation button.
+**Precedence:** defaults → `~/.config/whisperlocal/config.toml` → environment variables → command-line flags.
 
 ## Models
 
@@ -209,19 +233,63 @@ fetched once, cached in `~/.cache/huggingface`, and reused offline forever after
 | `medium` | 1.5 GB | 769 M | High accuracy, slower |
 | `large-v3-turbo` | 1.6 GB | 809 M | Best accuracy; nearly as fast as `medium` |
 
-Switch any time from the **Model** menu, or set `model` in your config.
+Any Hugging Face repo id also works. Note the `-mlx` suffix on the community
+builds — the un-suffixed names (`mlx-community/whisper-base`) do not resolve and
+return HTTP 401 on download.
 
-> Speed depends on your chip, so this table deliberately does not print
-> latency numbers. Try `base` first; if it keeps mishearing you, move up.
+> Speed depends on your chip, so this table deliberately prints no latency
+> numbers. Your own are in `whisperlocal stats`.
+
+## Your dictation stats
+
+Every dictation, successful or not, is appended to a JSONL file. Failures are
+logged too — the hallucination rate is only measurable if they are.
+
+```bash
+whisperlocal stats
+```
+
+```
+  dictations      29  (25 produced text)
+  words dictated  840
+  time speaking   8.3 min
+  speaking rate   107 wpm avg
+  transcribe time 1395 ms avg, 805 ms median, 6418 ms worst
+
+  outcomes
+    ok                 25   86.2%  ████████████████████····
+    empty               2    6.9%  █·······················
+    hallucination       1    3.4%  ························
+```
+
+...plus which apps you dictate into and words per day.
+
+One JSON object per line, append-only, so it reads straight into anything:
+
+```bash
+jq -r 'select(.status=="ok") | .text' ~/Library/Application\ Support/WhisperLocal/history.jsonl
+```
+
+```python
+pandas.read_json(path, lines=True)
+```
+
+> **This file is a permanent, unencrypted, plain-text record of everything you
+> dictate.** It is on by default. It lives in Application Support rather than
+> Documents specifically because Documents is iCloud-synced on many Macs, which
+> would upload the lot.
+>
+> - `history_text = false` keeps the statistics but not the words
+> - `history_enabled = false` turns it off entirely
+> - Deleting the file is a complete purge; nothing is indexed anywhere else
 
 ## Privacy
 
-The reason this project exists.
-
-- **No network calls at runtime.** The only download ever made is the model, once, on first use. After that you can run WhisperLocal with Wi-Fi off permanently.
+- **No network calls at runtime.** The only download ever made is the model, once. After that you can run WhisperLocal with Wi-Fi off permanently.
 - **No account, no API key, no telemetry, no analytics.**
-- **Audio never leaves your Mac.** Recordings are written to `~/Library/Caches/WhisperLocal/` and deleted immediately after transcription.
-- **Transcriptions go to your clipboard**, as they must, in order to be pasted. Anything with clipboard access can read them — the same is true of anything you copy.
+- **Audio never leaves your Mac.** Recordings go to `~/Library/Caches/WhisperLocal/` and are deleted immediately after transcription.
+- **The history file never leaves your Mac either** — but it is stored in plain text. See the box above.
+- **Transcriptions go to your clipboard**, as they must, in order to be pasted.
 
 ## Troubleshooting
 
@@ -232,51 +300,57 @@ whisperlocal doctor
 ```
 
 <details>
-<summary><b>The hotkey does nothing</b></summary>
+<summary><b>The trigger does nothing</b></summary>
 
 Grant **Input Monitoring** to your terminal, then fully quit and reopen it
-(closing the window is not enough). If another app has claimed the same key,
-pick a different `trigger_key`.
+(closing the window is not enough). `whisperlocal doctor` will tell you
+specifically whether the Fn event tap can be created.
 </details>
 
 <details>
 <summary><b>Text does not paste, but nothing errors</b></summary>
 
 Accessibility permission is missing. The text is still on your clipboard —
-press ⌘V. Run `whisperlocal doctor` to confirm, and grant Accessibility to
-your terminal. Some apps (a few password managers, secure input fields) refuse
+press ⌘V. Some apps (a few password managers, secure input fields) refuse
 synthetic keystrokes on purpose; `paste_mode = "clipboard"` is the workaround.
 </details>
 
 <details>
-<summary><b>Nothing gets recorded</b></summary>
+<summary><b>The mouse trigger fires while I am selecting text</b></summary>
 
-Grant **Microphone** permission. Check the input device in System Settings →
-Sound. `whisperlocal doctor` prints which device it would use.
+Lower `mouse_drag_cancel_px` so shorter drags cancel it, or raise
+`mouse_hold_threshold`. If it keeps happening, `mouse_right` or `mouse_middle`
+avoid the conflict entirely.
 </details>
 
 <details>
-<summary><b>The first dictation takes forever</b></summary>
+<summary><b>The mouse trigger never fires</b></summary>
 
-That is the model downloading. Sizes are in the table above. It happens once.
+The opposite problem: your hand is drifting past `mouse_drag_cancel_px` during
+the hold. Raise it to 20–25, or set it to `0` to switch the guard off.
+</details>
+
+<details>
+<summary><b>It repeated one word over and over — or pasted nothing after I spoke</b></summary>
+
+That is the hallucination guard doing its job: Whisper looped, and the output
+was discarded rather than pasted. It shows up as `hallucination` in
+`whisperlocal stats`. If real speech is being thrown away, raise `max_word_run`
+or lower `max_repeat_ratio`.
 </details>
 
 <details>
 <summary><b>Transcriptions are wrong or garbled</b></summary>
 
 Move up a model size (`small` or `large-v3-turbo`). If you are not speaking
-English, set `language` — naming your language is both faster and more accurate
-than `"auto"`.
+English, set `language` — naming your language is faster and more accurate than
+`"auto"`.
 </details>
 
 <details>
 <summary><b>"command not found: whisperlocal"</b></summary>
 
-The install directory is not on your PATH. Open a new terminal, or:
-
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-```
+Open a new terminal, or `export PATH="$HOME/.local/bin:$PATH"`.
 </details>
 
 ## Uninstall
@@ -285,41 +359,19 @@ export PATH="$HOME/.local/bin:$PATH"
 curl -fsSL https://raw.githubusercontent.com/shivamdixit17/whisperlocal/main/uninstall.sh | bash
 ```
 
-Removes the command, your settings and cached audio. Downloaded models are
-listed and kept, since that cache is shared with other Hugging Face tools — add
-`REMOVE_MODELS=1` to delete those too. `uv` and `ffmpeg` are always left alone.
+Removes the command, your settings and cached audio. **Your dictation history is
+left alone** — delete `~/Library/Application Support/WhisperLocal/` yourself if
+you want it gone. Downloaded models are also kept, since that cache is shared
+with other Hugging Face tools; add `REMOVE_MODELS=1` to delete those too. `uv`
+and `ffmpeg` are always left alone.
 
 ## Roadmap
 
-### Local dictation analytics — planned for v1.1
-
-> Not built yet. This section describes where the project is going, not what it
-> does today.
-
-Everything you dictate already runs through your own machine. The next release
-turns that into a private picture of your working day — without a single byte
-leaving your Mac.
-
-The idea: if you dictate notes, messages and commit descriptions all day, that
-stream quietly describes where your effort actually went. Today it is thrown
-away the moment it is pasted.
-
-Planned:
-
-- **Where your effort goes** — time and word volume grouped by the app you were dictating into, and by topic pulled from the text itself
-- **KPIs worth watching** — words dictated, sessions per day, active hours, average session length, longest focused stretch
-- **Trends** — how this week compares to last, which days are heavy, when you actually do your talking
-- **A local dashboard** — charts served from `whisperlocal stats`, opened in your browser from `localhost`, generated on your machine
-- **Export** — plain JSON and CSV, so it is your data in a format you can use elsewhere
-
-Non-negotiables it will ship with:
-
-- **Off by default.** Nothing is recorded until you turn it on.
-- **On-device only.** A local database. No account, no sync, no upload — the same rule the rest of the app follows.
-- **Yours to delete.** One command wipes the history; one setting stops collection.
-- **Retention you choose**, and the option to store only metadata (counts, timings, the app you were in) without keeping the transcribed text at all.
-
-Have thoughts on which metrics would actually be useful? Open an issue.
+Where the analytics are going, building on the history already collected:
+grouping effort by topic rather than just by app, week-over-week trends, and a
+local dashboard with real charts instead of ASCII bars. All of it staying on
+device, as everything here does. Thoughts on which metrics would actually be
+useful are welcome in an issue.
 
 ## Development
 
@@ -330,16 +382,18 @@ uv sync
 uv run whisperlocal doctor
 ```
 
-The project is deliberately small: `config.py` handles settings, `app.py` holds
-the recorder, transcriber, overlay, state machine and menu bar app, and `cli.py`
-is the entry point.
+`config.py` handles settings, `app.py` holds the recorder, transcriber, overlay,
+state machine and menu bar app, `stats.py` reads the history and `cli.py` is the
+entry point.
 
 ## Contributing
 
-Issues and pull requests are welcome. Useful things to know:
+Issues and pull requests welcome. Worth knowing before you start:
 
 - The state machine in `DictationEngine` is the heart of it — read that first.
-- Cocoa is not thread-safe. All overlay updates go through `FloatingOverlay._on_main_thread`.
+- **Cocoa is not thread-safe, and on macOS the assertions are fatal.** Every call into AppKit, HIToolbox or Text Services goes through `run_on_main()`. There is one such place on purpose; keep it that way.
+- Pasting deliberately does not use pynput's `Controller` — constructing one reaches Text Services and crashes off the main thread. Quartz posts the keystroke instead.
+- Audio is drained from a thread we own, not a PortAudio callback, and recorded at the device's native rate. Both of those are worked-around crashes, not style choices; the comments explain why.
 - Test on a real Apple Silicon Mac; CI can only check that the package builds.
 
 ## Built with

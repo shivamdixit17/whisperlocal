@@ -5,6 +5,8 @@
 #   curl -fsSL https://raw.githubusercontent.com/shivamdixit17/whisperlocal/main/uninstall.sh | bash
 #
 # Removes the whisperlocal command, your settings and the cached audio.
+# Your dictation history is deliberately NOT touched — delete
+# ~/Library/Application Support/WhisperLocal/ yourself if you want it gone.
 # Downloaded model weights are listed but kept, because the Hugging Face cache
 # is shared with any other ML tool you use. To remove those as well:
 #

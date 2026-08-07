@@ -98,16 +98,17 @@ macOS grants these to the app that LAUNCHES WhisperLocal — your terminal —
 not to WhisperLocal itself. Open System Settings → Privacy & Security and
 add your terminal to all three:
 
-   • Accessibility      so it can paste the text at your cursor
+   • Input Monitoring   so it can see the trigger while other apps are focused,
+                        and create the Fn event tap
    • Microphone         so it can hear you
-   • Input Monitoring   so it can see the trigger key while other apps are focused
+   • Accessibility      so it can paste the text at your cursor
 
 Then quit and reopen your terminal for them to take effect.
 
 EOF
     printf "%sVerify everything:%s  whisperlocal doctor\n" "$BOLD" "$RESET"
     printf "%sStart dictating:%s    whisperlocal\n\n" "$BOLD" "$RESET"
-    printf "%sHold Right Option (⌥) for a second, speak, let go.%s\n\n" "$DIM" "$RESET"
+    printf "%sHold the Fn (globe) key, speak, let go.%s\n\n" "$DIM" "$RESET"
 
     if ! command -v whisperlocal &>/dev/null; then
         warn "'whisperlocal' is not on your PATH yet — open a new terminal, or run:"

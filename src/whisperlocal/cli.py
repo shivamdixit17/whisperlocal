@@ -4,6 +4,7 @@ WhisperLocal — command line entry point.
     whisperlocal            start the menu bar app
     whisperlocal doctor     check that everything is set up correctly
     whisperlocal config     create, locate or print your settings
+    whisperlocal stats      summarise your dictation history
 """
 
 from __future__ import annotations
@@ -25,9 +26,9 @@ PERMISSION_PANES = {
     "Input Monitoring": f"{PANE}?Privacy_ListenEvent",
 }
 
-OK = "✅"
-WARN = "⚠️ "
-FAIL = "❌"
+OK = "OK  "
+WARN = "warn"
+FAIL = "FAIL"
 
 
 # ─── Platform guard ──────────────────────────────────────────────────────────────
@@ -35,15 +36,15 @@ FAIL = "❌"
 
 def check_platform() -> str | None:
     """
-    Return a human-readable reason this machine cannot run WhisperLocal,
-    or None if it can. Checked before any heavy import so an unsupported
-    machine gets an explanation instead of an MLX stack trace.
+    Return a human-readable reason this machine cannot run WhisperLocal, or
+    None if it can. Checked before any heavy import so an unsupported machine
+    gets an explanation instead of an MLX stack trace.
     """
     if sys.platform != "darwin":
         return (
             "WhisperLocal only runs on macOS. It is built on MLX (Apple's "
             "framework for Apple Silicon) and on macOS-specific APIs for the "
-            "menu bar and global hotkey."
+            "menu bar, the Fn key and the global hotkey."
         )
     if platform.machine() != "arm64":
         return (
@@ -74,19 +75,17 @@ def _check_microphone() -> tuple[bool, str]:
         return False, f"could not load sounddevice ({exc})"
 
     try:
-        default_input = sounddevice.default.device[0]
-        if default_input is None or default_input < 0:
-            return False, "no default input device — check System Settings → Sound"
-        name = sounddevice.query_devices(default_input)["name"]
-        return True, f"input device: {name}"
+        device = sounddevice.query_devices(kind="input")
+        rate = int(device.get("default_samplerate") or 0)
+        return True, f"input device: {device['name']} ({rate} Hz)"
     except Exception as exc:
         return False, f"no usable microphone ({exc})"
 
 
 def _check_accessibility() -> tuple[bool, str]:
     """
-    Accessibility is what lets us press Cmd+V for you. The permission belongs
-    to whichever app launched this process — usually your terminal.
+    Accessibility is what lets us press Cmd+V for you. The permission belongs to
+    whichever app launched this process — usually your terminal.
     """
     try:
         from ApplicationServices import AXIsProcessTrusted
@@ -96,18 +95,50 @@ def _check_accessibility() -> tuple[bool, str]:
     if AXIsProcessTrusted():
         return True, "Accessibility granted"
     return False, (
-        "Accessibility not granted for the app running this command.\n"
-        "      Without it, transcriptions are copied to your clipboard but "
-        "not pasted.\n"
+        "Accessibility not granted to the app running this command.\n"
+        "      Transcriptions will be copied to your clipboard but not pasted.\n"
         f"      Grant it here: {PERMISSION_PANES['Accessibility']}"
     )
 
 
+def _check_event_tap(settings: cfg.Settings) -> tuple[bool, str] | None:
+    """The Fn trigger needs a Quartz event tap, which needs Input Monitoring."""
+    if not settings.uses_fn:
+        return None
+    try:
+        from Quartz import (
+            CGEventMaskBit,
+            CGEventTapCreate,
+            kCGEventFlagsChanged,
+            kCGEventTapOptionListenOnly,
+            kCGHeadInsertEventTap,
+            kCGSessionEventTap,
+        )
+    except ImportError:
+        return False, "Quartz is unavailable — the Fn trigger cannot work"
+
+    tap = CGEventTapCreate(
+        kCGSessionEventTap,
+        kCGHeadInsertEventTap,
+        kCGEventTapOptionListenOnly,
+        CGEventMaskBit(kCGEventFlagsChanged),
+        lambda *a: None,
+        None,
+    )
+    if tap:
+        return True, "Fn event tap can be created"
+    return False, (
+        "cannot create the Fn event tap — the Fn key will never trigger.\n"
+        "      Grant Input Monitoring to your terminal, then restart it:\n"
+        f"      {PERMISSION_PANES['Input Monitoring']}"
+    )
+
+
 def _check_model_cached(settings: cfg.Settings) -> tuple[bool, str]:
-    """Report whether the selected model still needs to be downloaded."""
+    """Report whether the selected model still needs downloading."""
     org, _, name = settings.model_path.partition("/")
     hub = Path.home() / ".cache" / "huggingface" / "hub"
-    if hub.is_dir() and any(hub.glob(f"models--{org}--{name}*")):
+    if hub.is_dir() and any(hub.glob(f"models--{org}--{name}")):
         return True, f"model '{settings.model}' is downloaded"
     return False, (
         f"model '{settings.model}' is not downloaded yet — "
@@ -117,46 +148,64 @@ def _check_model_cached(settings: cfg.Settings) -> tuple[bool, str]:
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Run every check and summarize what, if anything, needs fixing."""
-    print(f"🩺 WhisperLocal {__version__} — checking your setup\n")
+    print(f"WhisperLocal {__version__} — checking your setup\n")
 
     problem = check_platform()
     if problem:
-        print(f"{FAIL} {problem}")
+        print(f"[{FAIL}] {problem}")
         return 1
 
-    print(f"{OK} macOS on Apple Silicon ({platform.mac_ver()[0] or 'unknown version'})")
-    print(f"{OK} Python {platform.python_version()}")
+    print(f"[{OK}] macOS on Apple Silicon ({platform.mac_ver()[0] or 'unknown version'})")
+    print(f"[{OK}] Python {platform.python_version()}")
 
     settings = cfg.load()
     path = cfg.config_path()
     if path.exists():
-        print(f"{OK} config: {path}")
+        print(f"[{OK}] config: {path}")
     else:
-        print(f"{OK} config: using defaults (run 'whisperlocal config --init' to change)")
+        print(f"[{OK}] config: defaults (run 'whisperlocal config --init' to change)")
+    print(f"[{OK}] trigger: {settings.trigger_label}")
 
-    # Hard requirements — these stop dictation from working at all.
+    # Hard requirements — these stop dictation working at all.
     failures = 0
-    for ok, message in (_check_ffmpeg(), _check_microphone()):
-        print(f"{OK if ok else FAIL} {message}")
+    checks = [_check_ffmpeg(), _check_microphone()]
+    tap = _check_event_tap(settings)
+    if tap:
+        checks.append(tap)
+
+    for ok, message in checks:
+        print(f"[{OK if ok else FAIL}] {message}")
         failures += 0 if ok else 1
 
     # Soft checks — degraded but usable.
     for ok, message in (_check_accessibility(), _check_model_cached(settings)):
-        print(f"{OK if ok else WARN} {message}")
+        print(f"[{OK if ok else WARN}] {message}")
+
+    if settings.history_enabled:
+        hp = settings.history_path
+        kind = "text + stats" if settings.history_text else "stats only"
+        if hp.exists():
+            with hp.open(encoding="utf-8") as fh:
+                count = sum(1 for line in fh if line.strip())
+            state = f"{count} entries"
+        else:
+            state = "no entries yet"
+        print(f"[{OK}] history: {kind}, {state}")
+        print(f"        {hp}")
 
     print()
-    print("These three permissions belong to the app that launches WhisperLocal")
+    print("These permissions belong to the app that launches WhisperLocal")
     print("(your terminal, or whatever wrapper you use). Grant all three:")
     for label, link in PERMISSION_PANES.items():
-        print(f"   • {label:<17} {link}")
+        print(f"   - {label:<17} {link}")
 
     print()
     if failures:
-        print(f"{FAIL} {failures} problem(s) to fix before dictation will work.")
+        print(f"[{FAIL}] {failures} problem(s) to fix before dictation will work.")
         return 1
 
-    print(f"{OK} Ready. Start it with: whisperlocal")
-    print(f"   Then hold {settings.trigger_label} for {settings.hold_threshold}s and speak.")
+    print(f"[{OK}] Ready. Start it with: whisperlocal")
+    print(f"        Then hold {settings.trigger_label} and speak.")
     return 0
 
 
@@ -173,11 +222,11 @@ def cmd_config(args: argparse.Namespace) -> int:
 
     if args.init:
         if path.exists() and not args.force:
-            print(f"{WARN} {path} already exists. Use --force to overwrite it.")
+            print(f"[{WARN}] {path} already exists. Use --force to overwrite it.")
             return 1
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(cfg.TEMPLATE, encoding="utf-8")
-        print(f"{OK} Wrote {path}")
+        print(f"[{OK}] Wrote {path}")
         print("   Open it in your editor and change whatever you like.")
         return 0
 
@@ -185,7 +234,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         try:
             settings = cfg.load(strict=True)
         except cfg.ConfigError as exc:
-            print(f"{FAIL} {exc}")
+            print(f"[{FAIL}] {exc}")
             print(f"   Fix it in {path}")
             return 1
 
@@ -194,10 +243,10 @@ def cmd_config(args: argparse.Namespace) -> int:
         width = max(len(f) for f in vars(settings))
         for key, value in vars(settings).items():
             env = f"{cfg.ENV_PREFIX}{key.upper()}"
-            print(f"  {key:<{width}}  {str(value):<22}  ({env})")
+            shown = ",".join(str(v) for v in value) if isinstance(value, tuple) else str(value)
+            print(f"  {key:<{width}}  {shown:<26}  ({env})")
         return 0
 
-    # No flag given: show where the config lives and what to do about it.
     if path.exists():
         print(f"Config file: {path}")
         print("  whisperlocal config --show    print the effective settings")
@@ -208,6 +257,18 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
+# ─── stats ───────────────────────────────────────────────────────────────────────
+
+
+def cmd_stats(args: argparse.Namespace) -> int:
+    """Summarise the dictation history."""
+    from whisperlocal import stats
+
+    settings = cfg.load()
+    path = Path(args.file).expanduser() if args.file else None
+    return stats.report(settings, days=args.days, show_text=args.text, path=path)
+
+
 # ─── run ─────────────────────────────────────────────────────────────────────────
 
 
@@ -215,41 +276,48 @@ def cmd_run(args: argparse.Namespace) -> int:
     """Start the menu bar app."""
     problem = check_platform()
     if problem:
-        print(f"{FAIL} {problem}")
+        print(f"[{FAIL}] {problem}")
         return 1
 
     if not shutil.which("ffmpeg"):
-        print(f"{FAIL} ffmpeg is required to decode audio but was not found.")
+        print(f"[{FAIL}] ffmpeg is required to decode audio but was not found.")
         print("   Install it with: brew install ffmpeg")
         print("   Then check everything with: whisperlocal doctor")
         return 1
 
-    # Imported here, not at module scope, so `doctor` and `config` still work
-    # on a machine where the audio stack is broken.
-    from whisperlocal.app import run
-
     settings = cfg.load()
+    overrides: dict[str, object] = {}
     if args.model:
-        settings = replace_checked(settings, "model", args.model)
+        overrides["model"] = args.model
     if args.language:
-        settings = replace_checked(settings, "language", args.language)
+        overrides["language"] = args.language
+    if args.trigger:
+        overrides["trigger_keys"] = tuple(
+            k.strip() for k in args.trigger.split(",") if k.strip()
+        )
+    if overrides:
+        settings = _apply_overrides(settings, overrides)
+
+    # Imported here, not at module scope, so `doctor`, `config` and `stats`
+    # still work on a machine where the audio stack is broken.
+    from whisperlocal.app import run
 
     try:
         return run(settings)
     except KeyboardInterrupt:
-        print("\n👋 Stopped")
+        print("\nStopped")
         return 0
 
 
-def replace_checked(settings: cfg.Settings, field: str, value: str) -> cfg.Settings:
-    """Apply a one-off command line override, validating it first."""
+def _apply_overrides(settings: cfg.Settings, overrides: dict) -> cfg.Settings:
+    """Apply one-off command line overrides, validating before we act on them."""
     import dataclasses
 
-    candidate = dataclasses.replace(settings, **{field: value})
+    candidate = dataclasses.replace(settings, **overrides)
     try:
         cfg.validate(candidate)
     except cfg.ConfigError as exc:
-        print(f"{FAIL} {exc}")
+        print(f"[{FAIL}] {exc}")
         raise SystemExit(2) from None
     return candidate
 
@@ -267,14 +335,15 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="Docs: https://github.com/shivamdixit17/whisperlocal",
     )
     parser.add_argument("--version", action="version", version=f"whisperlocal {__version__}")
+    parser.add_argument("--model", help="use this model for this run only")
+    parser.add_argument("--language", help="spoken language code for this run only, or 'auto'")
     parser.add_argument(
-        "--model",
-        choices=list(cfg.MODEL_OPTIONS),
-        help="use this model for this run only",
-    )
-    parser.add_argument(
-        "--language",
-        help="spoken language code for this run only, or 'auto' to detect it",
+        "--trigger",
+        metavar="KEYS",
+        help=(
+            "comma-separated trigger keys for this run only, e.g. 'fn,f13'. "
+            f"Supported: {', '.join(cfg.TRIGGER_KEYS)}"
+        ),
     )
 
     sub = parser.add_subparsers(dest="command")
@@ -288,6 +357,12 @@ def build_parser() -> argparse.ArgumentParser:
     config.add_argument("--path", action="store_true", help="print the config file path")
     config.add_argument("--show", action="store_true", help="print the effective settings")
     config.set_defaults(func=cmd_config)
+
+    stats = sub.add_parser("stats", help="summarise your dictation history")
+    stats.add_argument("--days", type=int, help="only the last N days")
+    stats.add_argument("--text", action="store_true", help="dump the transcripts too")
+    stats.add_argument("--file", help="read a different history file")
+    stats.set_defaults(func=cmd_stats)
 
     parser.set_defaults(func=cmd_run, command=None)
     return parser

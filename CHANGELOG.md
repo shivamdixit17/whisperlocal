@@ -3,70 +3,106 @@
 All notable changes to WhisperLocal are recorded here.
 This project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.1.0] — 2026-08-07
 
-### Planned
-
-- **Local dictation analytics (v1.1)** — an opt-in, on-device view of where
-  your effort goes: word volume and time grouped by app and topic, KPIs such as
-  sessions per day and active hours, trends week over week, and a local
-  dashboard via `whisperlocal stats`. Off by default, stored only on your Mac,
-  never uploaded, and deletable with one command. See the roadmap in the README.
-
-## [1.0.0] — 2026-08-07
-
-First public release. WhisperLocal went from a script that ran in its own
-folder to a tool anyone can install with one command.
+The engine that was actually in daily use, packaged properly — plus triggers
+you can pick.
 
 ### Added
 
-- **One-command install** — `install.sh` sets up uv, ffmpeg and WhisperLocal,
-  then explains the macOS permissions it needs.
-- **One-command uninstall** — `uninstall.sh` removes the command, settings and
-  cached audio. Model weights are kept unless `REMOVE_MODELS=1` is set, because
-  the Hugging Face cache is shared with other tools.
-- **`whisperlocal doctor`** — checks architecture, Python, ffmpeg, microphone,
-  Accessibility permission and whether the model is downloaded, with a deep
-  link to each System Settings pane that needs attention.
-- **`whisperlocal config`** — `--init`, `--show`, `--path` for a real config
-  file at `~/.config/whisperlocal/config.toml`.
-- **Layered configuration** — defaults, then config file, then `WHISPERLOCAL_*`
-  environment variables, then command-line flags.
-- **`paste_mode = "clipboard"`** — copy transcriptions without simulating ⌘V,
-  for apps that block synthetic input or if you would rather not grant
-  Accessibility permission.
-- **`language = "auto"`** — let Whisper detect the spoken language.
-- **More models** — `medium` and `large-v3-turbo` join tiny, base and small.
-- **Installable package** — `pyproject.toml` with a `whisperlocal` entry point.
+- **Several triggers at once.** `trigger_keys` takes a list, and holding any one
+  of them dictates. Whichever you press first owns the recording until you let
+  go, so pressing a second trigger mid-sentence no longer cuts you off.
+- **Mouse buttons as triggers** — `mouse_left`, `mouse_right`, `mouse_middle`,
+  for dictating when you are not near the keyboard. Two guards make this
+  workable rather than maddening:
+  - `mouse_hold_threshold` (default `1.0`, minimum `0.3`) is separate from the
+    key threshold, which defaults to `0` and would otherwise make every click
+    start a recording.
+  - `mouse_drag_cancel_px` (default `10`) cancels the trigger once a press
+    starts travelling, because that is a drag or a text selection, not someone
+    holding still to talk. It applies only *before* recording starts — once you
+    are recording you can move the mouse freely.
+- **`whisperlocal stats`** — the dictation history summary, previously a
+  standalone `history_stats.py`. Words, speaking rate, transcription latency,
+  outcome rates including hallucinations, per-app breakdown and words per day.
+- **`whisperlocal doctor`** now also checks whether the Fn event tap can be
+  created, which is the single most common reason the Fn trigger silently does
+  nothing.
+- **`history_text = false`** keeps the statistics without storing the
+  transcribed words.
+- **Layered configuration** — defaults, then `~/.config/whisperlocal/config.toml`,
+  then `WHISPERLOCAL_*` environment variables, then command-line flags. The old
+  single-value `trigger_key` is still accepted.
+- **`--trigger`** to try a different trigger for one run without editing config.
+
+### Changed
+
+- Fn (globe) is now the default trigger, replacing Right Option.
+- `hold_threshold` defaults to `0.0` — recording starts the instant the key goes
+  down, so you can talk straight away. Stray taps are still discarded by
+  `min_recording_duration`.
+- The overlay is a single small dot near the bottom of the screen — red and
+  breathing while recording, steady amber while transcribing — instead of a
+  panel with text.
+- Menu bar icons are SF Symbols, tinted, rather than emoji.
+- The model is chosen in config rather than from a menu. Every switch in the old
+  menu pulled another 85–500 MB into the Hugging Face cache and left it there.
+- History is written to Application Support, deliberately not Documents, which
+  is iCloud-synced on many Macs and would upload a full record of everything
+  dictated.
+
+### Fixed
+
+Carried over from the version in daily use, none of which was in 1.0.0:
+
+- **Whisper repetition loops were being pasted.** On short or noisy audio the
+  decoder gets stuck emitting one token — observed as 112 words of "ARP", 223 of
+  "funny". Output is now checked for a long repeated run and for a low
+  unique-word ratio, and discarded rather than dumped into whatever you had
+  focused. Tuned against measured data so real speech survives.
+- **Recording at a rate the hardware does not run at segfaulted CoreAudio.**
+  Asking PortAudio for 16 kHz on a 48 kHz mic forces its rate-adapting path,
+  which crashes on the realtime thread. Recording now runs at the device's
+  native rate; whisper's ffmpeg loader downsamples on read.
+- **Audio was drained on CoreAudio's realtime thread.** Handing a Python
+  callback to PortAudio ran the interpreter there and crashed with
+  EXC_BAD_ACCESS via cffi's closure trampoline. A thread we own drains the
+  stream instead.
+- **Pasting crashed the process with SIGTRAP.** Constructing pynput's
+  `Controller` reaches HIToolbox Text Services, which asserts the main dispatch
+  queue — fatal off the main thread. Quartz posts the keystroke directly,
+  skipping the layout map.
+- **Menu bar updates ran off the main thread**, tripping the same AppKit
+  assertion. All of it now goes through a single `run_on_main()` boundary.
+- **The Fn key could not be used as a trigger at all.** It is not a keycode,
+  only a modifier flag bit, so pynput cannot see it. A Quartz event tap watches
+  the flag, re-arming itself if macOS disables it for slowness.
+
+## [1.0.0] — 2026-08-07
+
+First public release: packaging, one-command install and uninstall, and the
+fixes below.
+
+### Added
+
+- One-command `install.sh` and `uninstall.sh`.
+- `whisperlocal doctor` and `whisperlocal config`.
+- `paste_mode = "clipboard"` for apps that block synthetic input.
+- `language = "auto"`.
+- Installable package with a `whisperlocal` entry point.
 
 ### Fixed
 
 - **Model repository IDs were broken.** `mlx-community/whisper-base` and
-  `whisper-small` no longer resolve and fail with HTTP 401 on download. All
-  model IDs now use the working `-mlx` suffixed repositories, so a fresh
-  install can actually fetch weights.
-- **`trigger_key` was ignored.** The setting existed and was documented, but
-  the key was hardcoded to Right Option. It now works, and accepts
-  `alt_r`, `alt_l`, `cmd_r`, `ctrl_r`, `shift_r` and `f13`–`f19`. An
-  unsupported value fails at startup with the list of valid options instead of
-  silently never triggering.
-- **The app only ran from its own directory.** Recorded audio was written next
-  to the source files; it now goes to `~/Library/Caches/WhisperLocal/`.
-- **Intel Macs got an opaque MLX crash.** They now get an explanation, checked
-  before any heavy import.
-- **Switching models could raise a `RuntimeError`.** The menu callback renamed
-  items while iterating the menu that is keyed by those names.
-- **A missing `numpy` bypassed the friendly import error** it was supposed to
-  produce.
-- **Microphone failures were unhandled** — starting a recording without
-  permission now explains itself instead of raising.
+  `whisper-small` no longer resolve and fail with HTTP 401. All model IDs use
+  the working `-mlx` repositories.
+- **`trigger_key` was ignored** — documented as configurable but hardcoded.
+- **The app only ran from its own directory**; recordings were written next to
+  the source files.
+- **Intel Macs got an opaque MLX crash** instead of an explanation.
+- **Switching models could raise a `RuntimeError`** by renaming menu items while
+  iterating the menu keyed by those names.
 
-### Changed
-
-- `fp16` now defaults to `true`, matching mlx-whisper's own default. The
-  previous hardcoded `false` gave up half precision on hardware built for it.
-- `setup.sh` and `start.sh` are gone, replaced by `install.sh` and the
-  installed `whisperlocal` command. The from-source workflow is now
-  `uv sync && uv run whisperlocal`.
-
+[1.1.0]: https://github.com/shivamdixit17/whisperlocal/releases/tag/v1.1.0
 [1.0.0]: https://github.com/shivamdixit17/whisperlocal/releases/tag/v1.0.0
