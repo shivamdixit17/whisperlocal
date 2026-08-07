@@ -34,6 +34,13 @@ export PATH="$HOME/.local/bin:$PATH"
 
 removed_anything=0
 
+# ── The menu bar app, login item and bundle ──────────────────────────────────
+# Done first, while the command that knows how to undo it still exists.
+if command -v whisperlocal &>/dev/null; then
+    whisperlocal uninstall-app 2>&1 | sed 's/^/  /' || true
+    removed_anything=1
+fi
+
 # ── The command itself ───────────────────────────────────────────────────────
 if command -v uv &>/dev/null && uv tool list 2>/dev/null | grep -q "^${TOOL_NAME}"; then
     uv tool uninstall "$TOOL_NAME" >/dev/null 2>&1

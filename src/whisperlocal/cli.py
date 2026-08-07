@@ -5,6 +5,10 @@ WhisperLocal — command line entry point.
     whisperlocal doctor     check that everything is set up correctly
     whisperlocal config     create, locate or print your settings
     whisperlocal stats      summarise your dictation history
+
+    whisperlocal install-app    install the menu bar app (starts at login)
+    whisperlocal uninstall-app  remove it
+    whisperlocal probe-caret    check if an app reports its text cursor
 """
 
 from __future__ import annotations
@@ -13,6 +17,7 @@ import argparse
 import platform
 import shutil
 import sys
+import time
 from pathlib import Path
 
 from whisperlocal import __version__
@@ -269,6 +274,87 @@ def cmd_stats(args: argparse.Namespace) -> int:
     return stats.report(settings, days=args.days, show_text=args.text, path=path)
 
 
+# ─── app bundle ──────────────────────────────────────────────────────────────────
+
+
+def cmd_install_app(args: argparse.Namespace) -> int:
+    """Build the macOS app bundle so it runs without a terminal."""
+    problem = check_platform()
+    if problem:
+        print(f"[{FAIL}] {problem}")
+        return 1
+
+    from whisperlocal import appbundle
+
+    return appbundle.install(force=args.force, start=not args.no_start)
+
+
+def cmd_uninstall_app(args: argparse.Namespace) -> int:
+    """Remove the app bundle and its login item."""
+    from whisperlocal import appbundle
+
+    return appbundle.uninstall()
+
+
+# ─── probe-caret ─────────────────────────────────────────────────────────────────
+
+
+def cmd_probe_caret(args: argparse.Namespace) -> int:
+    """
+    Report what the focused app tells macOS about its text cursor.
+
+    Cursor detection genuinely does not work everywhere, so this answers "why is
+    the dot not next to my cursor in this app?" without guesswork.
+    """
+    problem = check_platform()
+    if problem:
+        print(f"[{FAIL}] {problem}")
+        return 1
+
+    from whisperlocal.app import (
+        caret_screen_rect,
+        frontmost_app,
+        mouse_screen_point,
+        primary_screen_height,
+    )
+
+    trusted, message = _check_accessibility()
+    if not trusted:
+        print(f"[{FAIL}] {message}")
+        print()
+        print("   Cursor detection needs Accessibility. If you are running this")
+        print("   from a terminal, the terminal is what needs the permission.")
+        return 1
+
+    if args.delay:
+        print(f"Switch to the app you want to test — probing in {args.delay}s...")
+        time.sleep(args.delay)
+
+    name, bundle_id = frontmost_app()
+    print(f"Frontmost app : {name or '?'} ({bundle_id or '?'})")
+
+    rect = caret_screen_rect()
+    if rect:
+        x, y, w, h = rect
+        kind = "text cursor" if h and w == 0 else "focused element"
+        print(f"Reported      : {kind}")
+        print(f"  Accessibility coords  x={x:.0f} y={y:.0f} w={w:.0f} h={h:.0f}")
+        print(f"  (screen origin is top-left; primary height {primary_screen_height():.0f})")
+        print()
+        print(f"[{OK}] The dot will appear next to your cursor in this app.")
+    else:
+        print("Reported      : nothing")
+        point = mouse_screen_point()
+        where = f"x={point[0]:.0f} y={point[1]:.0f}" if point else "unavailable"
+        print(f"  Mouse pointer fallback  {where}")
+        print()
+        print(f"[{WARN}] This app does not report its cursor position to macOS.")
+        print("       The dot will follow your mouse pointer here instead.")
+        print("       Common with Electron apps and some browser text fields;")
+        print("       there is nothing WhisperLocal can do about it.")
+    return 0
+
+
 # ─── run ─────────────────────────────────────────────────────────────────────────
 
 
@@ -363,6 +449,32 @@ def build_parser() -> argparse.ArgumentParser:
     stats.add_argument("--text", action="store_true", help="dump the transcripts too")
     stats.add_argument("--file", help="read a different history file")
     stats.set_defaults(func=cmd_stats)
+
+    install_app = sub.add_parser(
+        "install-app", help="install the menu bar app so it starts at login"
+    )
+    install_app.add_argument(
+        "--force", action="store_true", help="rebuild even if unchanged (re-signs; "
+        "macOS will forget the granted permissions)"
+    )
+    install_app.add_argument(
+        "--no-start", action="store_true", help="install but do not launch it now"
+    )
+    install_app.set_defaults(func=cmd_install_app)
+
+    uninstall_app = sub.add_parser(
+        "uninstall-app", help="remove the menu bar app and its login item"
+    )
+    uninstall_app.set_defaults(func=cmd_uninstall_app)
+
+    probe = sub.add_parser(
+        "probe-caret", help="check whether an app reports its text cursor position"
+    )
+    probe.add_argument(
+        "--delay", type=float, default=0,
+        help="seconds to wait first, so you can switch to the app to test",
+    )
+    probe.set_defaults(func=cmd_probe_caret)
 
     parser.set_defaults(func=cmd_run, command=None)
     return parser

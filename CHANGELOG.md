@@ -3,6 +3,59 @@
 All notable changes to WhisperLocal are recorded here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] — 2026-08-07
+
+It installs as a real Mac app now, and the recording dot follows your text
+cursor instead of sitting in a corner.
+
+### Added
+
+- **A proper menu bar app.** The installer builds
+  `~/Applications/WhisperLocal.app`, signs it, registers it as a Login Item and
+  launches it. The terminal is needed exactly once, to install. After that it
+  starts at login and survives reboots — no command to run, no window to keep
+  open.
+
+  This also fixes the worst part of the old setup: macOS attached the
+  Accessibility and Input Monitoring grants to *whichever terminal* started the
+  app, so they broke as soon as you used a different one. They now belong to
+  WhisperLocal itself.
+
+  The bundle is byte-identical across every release and every machine, and
+  `install-app` compares before it writes. macOS keys those grants to the
+  bundle's cdhash, so an upgrade that rebuilt it would silently revoke them.
+  Verified: a bundle built from scratch produces the same cdhash as one that has
+  been installed and granted for weeks.
+
+- **`whisperlocal install-app` / `uninstall-app`** — install, repair or remove
+  the app and its login item.
+
+- **The recording dot follows your text cursor.** It appears next to wherever
+  you are actually typing, on whichever monitor, rather than fixed above the
+  Dock. New `overlay_anchor` (`"caret"`, `"mouse"`, `"bottom"`) with
+  `overlay_offset_x` / `overlay_offset_y`.
+
+  Cursor position is read through the Accessibility API with a 0.25 s messaging
+  timeout — this runs on the key path, and with the Fn trigger that is the event
+  tap's callback on the main runloop, exactly where a blocking call gets the tap
+  disabled for being slow. Apps that do not report a cursor (many Electron apps,
+  some browser fields) fall back to the mouse pointer, then to the bottom of the
+  screen.
+
+- **`whisperlocal probe-caret`** — shows what the focused app reports about its
+  cursor, so "why is the dot at my mouse in this app?" has an answer.
+
+- **A first-run permissions prompt** from inside the app, with a button that
+  opens the right System Settings pane, plus a **Permissions…** menu item to
+  re-check. The microphone still uses the native macOS prompt.
+
+### Fixed
+
+- **Restarting could leave the old process running**, giving two Fn listeners
+  and two menu bar icons. `pgrep -f "-m whisperlocal"` parses the leading `-m`
+  as an option and matches nothing, silently — so stopping the supervisor
+  orphaned its child rather than killing it.
+
 ## [1.1.0] — 2026-08-07
 
 The engine that was actually in daily use, packaged properly — plus triggers
@@ -104,5 +157,6 @@ fixes below.
 - **Switching models could raise a `RuntimeError`** by renaming menu items while
   iterating the menu keyed by those names.
 
+[1.2.0]: https://github.com/shivamdixit17/whisperlocal/releases/tag/v1.2.0
 [1.1.0]: https://github.com/shivamdixit17/whisperlocal/releases/tag/v1.1.0
 [1.0.0]: https://github.com/shivamdixit17/whisperlocal/releases/tag/v1.0.0

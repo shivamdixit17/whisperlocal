@@ -19,8 +19,10 @@ Everything runs on your Mac. No account, no API key, no network call, no upload.
 curl -fsSL https://raw.githubusercontent.com/shivamdixit17/whisperlocal/main/install.sh | bash
 ```
 
-That is the whole install. It sets up everything it needs, then tells you which
-macOS permissions to grant.
+That is the whole install, and the only time you need a terminal. It installs
+WhisperLocal as a real menu bar app in `~/Applications`, starts it, and sets it
+to launch at login. From then on it is just there — no command to run, no window
+to keep open, and it survives a reboot.
 
 <details>
 <summary><b>Prefer to read the script before running it?</b> (recommended)</summary>
@@ -52,7 +54,8 @@ uv tool install git+https://github.com/shivamdixit17/whisperlocal.git
 
 Hold the **Fn (globe)** key. Speak. Let go. A moment later your words are typed
 in at the cursor — in your editor, your browser, Slack, a terminal, anywhere
-text goes.
+text goes. A small red dot pulses next to your cursor while it listens, so you
+always know the microphone is open and where the text is going to land.
 
 ```mermaid
 stateDiagram-v2
@@ -90,8 +93,9 @@ down, so you can talk straight away. Stray taps are thrown out afterwards by
 - **Genuinely offline** — after the model downloads once, it never touches the network again.
 - **Hallucination guard** — Whisper loops on short or noisy audio and emits one word hundreds of times. That output is detected and thrown away instead of dumped into whatever you had focused.
 - **Pastes anywhere** — straight into the app you were in when you started talking.
-- **Menu bar app** — SF Symbol status icon, last transcription, on/off toggle.
-- **A single quiet dot** near the bottom of the screen: red breathing while recording, amber while transcribing.
+- **A real Mac app** — installs to `~/Applications`, starts at login, lives in the menu bar. No terminal, ever.
+- **Menu bar app** — SF Symbol status icon, last transcription, on/off toggle, permissions check.
+- **A single quiet dot beside your text cursor**: red and breathing while recording, amber while transcribing.
 - **Your own dictation stats** — `whisperlocal stats` shows words, speaking rate, transcription latency, failure rates, which apps you dictate into and words per day.
 - **`whisperlocal doctor`** — tells you exactly what is misconfigured instead of failing silently.
 
@@ -107,24 +111,42 @@ down, so you can talk straight away. Stray taps are thrown out afterwards by
 
 ## Usage
 
-```bash
-whisperlocal
-```
+After installing, it is already running and will start again at every login.
+Hold your trigger, speak, release. There is nothing to launch.
 
-An icon appears in your menu bar. Then hold your trigger, speak, and release.
+The menu bar icon gives you status, your last transcription, an on/off toggle,
+a permissions check and Quit.
 
 ### Command line
 
+You never need these, but they are there:
+
 ```bash
-whisperlocal                        # start the menu bar app
 whisperlocal doctor                 # check your setup, diagnose problems
 whisperlocal stats                  # summarise your dictation history
 whisperlocal stats --days 7         # ...for the last week
 whisperlocal config --init          # create a config file
 whisperlocal config --show          # show the settings actually in effect
+whisperlocal probe-caret            # does this app report its text cursor?
+whisperlocal install-app            # (re)install the menu bar app, repair it
+whisperlocal uninstall-app          # remove the app and its login item
+whisperlocal                        # run in the foreground, for debugging
 whisperlocal --trigger fn,f13       # override triggers for one run
 whisperlocal --model small          # override the model for one run
 ```
+
+### Where it lives
+
+| | |
+|---|---|
+| `~/Applications/WhisperLocal.app` | The app. Starts at login; owns the macOS permissions |
+| `~/Applications/WhisperLocal/start.sh` | Restarts it if it ever crashes |
+| `~/.config/whisperlocal/config.toml` | Your settings |
+| `~/Library/Logs/WhisperLocal.log` | What it has been doing |
+
+The app bundle is deliberately tiny and never changes between releases. macOS
+ties your granted permissions to its exact contents, so upgrades leave it
+untouched — otherwise every update would silently revoke them.
 
 ## Trigger keys
 
@@ -169,18 +191,24 @@ choice if they are free on your mouse.
 
 ## Permissions
 
-macOS grants these to **the app that launches WhisperLocal** — your terminal —
-not to WhisperLocal itself. This is how macOS works for any tool like this.
-
-Open **System Settings → Privacy & Security** and add your terminal to:
+WhisperLocal asks for these itself on first launch, with a button that opens the
+right Settings pane. You grant them to **WhisperLocal**, not to your terminal,
+because the installer sets it up as a proper app bundle.
 
 | Permission | Why it is needed | Without it |
 |---|---|---|
 | **Input Monitoring** | To see the trigger while another app is focused, and to create the Fn event tap | The trigger never fires |
+| **Accessibility** | To press ⌘V for you, and to find your text cursor | Text is copied to your clipboard but not pasted; the dot falls back to your mouse |
 | **Microphone** | To hear you | Nothing records |
-| **Accessibility** | To press ⌘V for you | Text is copied to your clipboard; you paste it |
 
-Quit and reopen your terminal afterwards, then run `whisperlocal doctor`.
+**The microphone needs nothing from you in advance** — macOS prompts for it the
+first time you dictate.
+
+**The other two cannot be automated.** macOS deliberately requires a human to
+switch them on in System Settings; no installer of any kind can do it for you.
+WhisperLocal opens the exact pane so it is two clicks rather than a hunt. Quit
+and reopen it from the menu bar afterwards, then check with `whisperlocal
+doctor`. There is a **Permissions…** item in the menu to re-check any time.
 
 > Don't want to grant Accessibility? Set `paste_mode = "clipboard"`.
 > WhisperLocal will copy transcriptions and let you paste them yourself.
@@ -206,6 +234,8 @@ whisperlocal config --init && open ~/.config/whisperlocal/config.toml
 | `paste_mode` | `"paste"` | `"paste"` presses ⌘V; `"clipboard"` only copies |
 | `sounds` | `true` | System sounds for each state |
 | `overlay` | `true` | The floating dot |
+| `overlay_anchor` | `"caret"` | `"caret"`, `"mouse"` or `"bottom"` — see below |
+| `overlay_offset_x` / `overlay_offset_y` | `14` / `0` | Nudge the dot away from the anchor |
 | `history_enabled` | `true` | Record dictations for `whisperlocal stats` |
 | `history_text` | `true` | Store the words themselves, not just the statistics |
 | `max_word_run` | `4` | Longest allowed run of one repeated word before output is judged a loop |
@@ -219,6 +249,31 @@ WHISPERLOCAL_MODEL=small WHISPERLOCAL_TRIGGER_KEYS=fn,f13 whisperlocal
 ```
 
 **Precedence:** defaults → `~/.config/whisperlocal/config.toml` → environment variables → command-line flags.
+
+## The recording dot
+
+While recording, a small red dot pulses **next to your text cursor** — wherever
+you happen to be typing — and turns steady amber while transcribing. It is
+click-through, sits above everything, and appears on whichever monitor you are
+working on.
+
+```toml
+overlay_anchor = "caret"    # "caret", "mouse" or "bottom"
+```
+
+Finding the cursor relies on the app you are typing in reporting its position to
+macOS. Most native apps do. Many Electron apps and some browser text fields
+never have, and there is nothing WhisperLocal can do about that — in those it
+**falls back to your mouse pointer**, then to the bottom of the screen.
+
+To see what a given app reports:
+
+```bash
+whisperlocal probe-caret --delay 5     # switch to the app you want to test
+```
+
+Prefer it somewhere fixed? `overlay_anchor = "bottom"` pins it above the Dock,
+or `overlay = false` turns it off entirely.
 
 ## Models
 
@@ -340,6 +395,26 @@ or lower `max_repeat_ratio`.
 </details>
 
 <details>
+<summary><b>The dot appears at my mouse instead of my text cursor</b></summary>
+
+That app does not report its cursor position to macOS — common with Electron
+apps and some browser fields. Confirm with `whisperlocal probe-caret --delay 5`.
+There is no fix from this side; `overlay_anchor = "bottom"` is the alternative
+if a wandering dot bothers you.
+</details>
+
+<details>
+<summary><b>It stopped starting at login</b></summary>
+
+```bash
+whisperlocal install-app
+```
+
+Rebuilds and re-registers it. It leaves the app bundle alone if it is intact, so
+your granted permissions survive.
+</details>
+
+<details>
 <summary><b>Transcriptions are wrong or garbled</b></summary>
 
 Move up a model size (`small` or `large-v3-turbo`). If you are not speaking
@@ -359,8 +434,8 @@ Open a new terminal, or `export PATH="$HOME/.local/bin:$PATH"`.
 curl -fsSL https://raw.githubusercontent.com/shivamdixit17/whisperlocal/main/uninstall.sh | bash
 ```
 
-Removes the command, your settings and cached audio. **Your dictation history is
-left alone** — delete `~/Library/Application Support/WhisperLocal/` yourself if
+Removes the app, its login item, the command, your settings and cached audio.
+**Your dictation history is left alone** — delete `~/Library/Application Support/WhisperLocal/` yourself if
 you want it gone. Downloaded models are also kept, since that cache is shared
 with other Hugging Face tools; add `REMOVE_MODELS=1` to delete those too. `uv`
 and `ffmpeg` are always left alone.

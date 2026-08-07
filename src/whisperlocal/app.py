@@ -56,6 +56,7 @@ try:
         NSFontWeightRegular,
         NSImage,
         NSImageSymbolConfiguration,
+        NSMakePoint,
         NSMakeRect,
         NSScreen,
         NSView,
@@ -84,6 +85,29 @@ try:
 except ImportError:  # pragma: no cover
     HAS_QUARTZ = False
     print("Warning: Quartz not available — pasting disabled")
+
+# Accessibility, used to find where the text cursor is so the recording dot can
+# sit next to it instead of in a fixed corner.
+try:
+    from ApplicationServices import (
+        AXUIElementCopyAttributeValue,
+        AXUIElementCopyParameterizedAttributeValue,
+        AXUIElementCreateSystemWide,
+        AXUIElementSetMessagingTimeout,
+        AXValueGetValue,
+        kAXBoundsForRangeParameterizedAttribute,
+        kAXFocusedUIElementAttribute,
+        kAXPositionAttribute,
+        kAXSelectedTextRangeAttribute,
+        kAXSizeAttribute,
+        kAXValueTypeCGPoint,
+        kAXValueTypeCGRect,
+        kAXValueTypeCGSize,
+    )
+
+    HAS_AX = True
+except ImportError:  # pragma: no cover
+    HAS_AX = False
 
 # Event-tap symbols, used to watch the Fn key. pynput has no Fn key at all, so
 # the only way to trigger on it is to read the raw modifier flags.
@@ -259,6 +283,126 @@ def frontmost_app() -> tuple[str | None, str | None]:
         return app.localizedName(), app.bundleIdentifier()
     except Exception:
         return None, None
+
+
+# ─── Finding the text cursor ─────────────────────────────────────────────────────
+
+# How long to wait for an app to answer an Accessibility query. This runs on the
+# key path — and with the Fn trigger, on the event tap's callback on the main
+# runloop — so it must never block. Without a timeout, one busy or wedged app
+# would hang the query indefinitely and macOS would disable the tap for being
+# slow. A quarter second is far more than a healthy app needs, and anything
+# slower falls back to the mouse pointer.
+AX_TIMEOUT = 0.25
+
+# Sanity bounds for a caret rectangle. A caret is zero-width by nature, so only
+# the height is checked; anything outside this is a misreported element rather
+# than a text cursor.
+MIN_CARET_HEIGHT = 2
+MAX_CARET_HEIGHT = 200
+
+
+def _ax_attr(element, attribute):
+    """Read one Accessibility attribute, or None."""
+    try:
+        err, value = AXUIElementCopyAttributeValue(element, attribute, None)
+    except Exception:
+        return None
+    return None if err else value
+
+
+def _ax_unpack(value, ax_type):
+    """Turn an AXValue into a plain CoreGraphics struct, or None."""
+    if value is None:
+        return None
+    try:
+        ok, unpacked = AXValueGetValue(value, ax_type, None)
+    except Exception:
+        return None
+    return unpacked if ok else None
+
+
+def _focused_element_rect(element):
+    """
+    Bounding box of the focused control itself, in AX screen coordinates.
+
+    The fallback for apps that expose a focused element but not a caret range —
+    a text area still tells us roughly where to put the dot.
+    """
+    position = _ax_unpack(_ax_attr(element, kAXPositionAttribute), kAXValueTypeCGPoint)
+    size = _ax_unpack(_ax_attr(element, kAXSizeAttribute), kAXValueTypeCGSize)
+    if position is None or size is None:
+        return None
+    if size.height <= 0 or size.width <= 0:
+        return None
+
+    # Anchor to the top-left of the control rather than its centre: for a large
+    # text area the top-left is where the text starts, and where the eye is.
+    return (position.x, position.y, 0.0, min(size.height, MAX_CARET_HEIGHT))
+
+
+def caret_screen_rect():
+    """
+    Where the text cursor is, as (x, y, width, height) in Accessibility screen
+    coordinates — origin top-left, y increasing downward.
+
+    Returns None when it cannot be determined, which is common: many Electron
+    apps and some browser fields never implement these attributes. Callers fall
+    back to the mouse pointer.
+    """
+    if not HAS_AX:
+        return None
+
+    try:
+        system = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(system, AX_TIMEOUT)
+    except Exception:
+        return None
+
+    element = _ax_attr(system, kAXFocusedUIElementAttribute)
+    if element is None:
+        return None
+
+    try:
+        AXUIElementSetMessagingTimeout(element, AX_TIMEOUT)
+    except Exception:
+        pass
+
+    text_range = _ax_attr(element, kAXSelectedTextRangeAttribute)
+    if text_range is None:
+        return _focused_element_rect(element)
+
+    try:
+        err, bounds = AXUIElementCopyParameterizedAttributeValue(
+            element, kAXBoundsForRangeParameterizedAttribute, text_range, None
+        )
+    except Exception:
+        return _focused_element_rect(element)
+    if err or bounds is None:
+        return _focused_element_rect(element)
+
+    rect = _ax_unpack(bounds, kAXValueTypeCGRect)
+    if rect is None:
+        return _focused_element_rect(element)
+
+    height = rect.size.height
+    if not (MIN_CARET_HEIGHT <= height <= MAX_CARET_HEIGHT):
+        return _focused_element_rect(element)
+
+    return (rect.origin.x, rect.origin.y, rect.size.width, height)
+
+
+def mouse_screen_point():
+    """The pointer, in Cocoa screen coordinates (origin bottom-left)."""
+    if not HAS_COCOA:
+        return None
+    try:
+        from AppKit import NSEvent
+
+        point = NSEvent.mouseLocation()
+        return (point.x, point.y)
+    except Exception:
+        return None
 
 
 # ─── Fn key listener ─────────────────────────────────────────────────────────────
@@ -681,23 +825,92 @@ def looks_degenerate(text: str, settings: Settings) -> bool:
     return len(set(words)) / len(words) < settings.max_repeat_ratio
 
 
+# ─── Screen geometry ─────────────────────────────────────────────────────────────
+#
+# Two coordinate systems meet here and they disagree about which way is up:
+#
+#   Accessibility  origin at the TOP-left of the primary screen, y grows DOWN
+#   Cocoa windows  origin at the BOTTOM-left of the primary screen, y grows UP
+#
+# The flip is always against the *primary* screen's height, never the screen the
+# point happens to be on — on a multi-monitor setup those differ, and using the
+# wrong one puts the dot on the wrong display. These are kept as plain functions
+# of their inputs so the arithmetic can be tested without a screen attached.
+
+
+def ax_y_to_cocoa_y(ax_y: float, ax_height: float, primary_height: float) -> float:
+    """Vertical centre of an AX rect, in Cocoa coordinates."""
+    return primary_height - (ax_y + ax_height / 2.0)
+
+
+def clamp_to_frame(x: float, y: float, size: float, frame) -> tuple[float, float]:
+    """
+    Keep a `size` x `size` window fully inside `frame`.
+
+    frame is (origin_x, origin_y, width, height) in Cocoa coordinates, and may
+    have a negative origin — a display arranged to the left of the primary one
+    starts at a negative x.
+    """
+    fx, fy, fw, fh = frame
+    x = min(max(x, fx), fx + fw - size)
+    y = min(max(y, fy), fy + fh - size)
+    return x, y
+
+
+def _screens():
+    """(frame, visible_frame) for each screen, as plain tuples."""
+    if not HAS_COCOA:
+        return []
+    out = []
+    for screen in NSScreen.screens():
+        f, v = screen.frame(), screen.visibleFrame()
+        out.append(
+            (
+                (f.origin.x, f.origin.y, f.size.width, f.size.height),
+                (v.origin.x, v.origin.y, v.size.width, v.size.height),
+            )
+        )
+    return out
+
+
+def visible_frame_for_point(x: float, y: float):
+    """The visible frame of the screen containing a Cocoa point, else the primary."""
+    screens = _screens()
+    if not screens:
+        return None
+    for frame, visible in screens:
+        fx, fy, fw, fh = frame
+        if fx <= x <= fx + fw and fy <= y <= fy + fh:
+            return visible
+    return screens[0][1]
+
+
+def primary_screen_height() -> float:
+    """Height of the primary screen — the origin for the AX/Cocoa flip."""
+    screens = _screens()
+    return screens[0][0][3] if screens else 0.0
+
+
 # ─── Floating overlay ────────────────────────────────────────────────────────────
 
 
 class FloatingOverlay:
     """
-    A single small dot near the bottom of the screen — the only visual feedback
+    A single small dot that follows your text cursor — the only visual feedback
     while recording or transcribing.
 
     Deliberately minimal: no panel, no text, no shadow. Red means recording,
     amber means transcribing. It breathes while recording so you can tell it is
     live, and holds steady while transcribing.
+
+    It appears beside wherever you are actually typing. When the cursor cannot
+    be located — plenty of apps never report it — it falls back to the mouse
+    pointer, and finally to the bottom of the screen.
     """
 
     DOT_SIZE = 11
-    # Lifted clear of the Dock. Measured from the visible area, which already
-    # excludes the Dock, so it sits in easy peripheral view rather than tucked
-    # into a corner.
+    # Fallback position: lifted clear of the Dock. Measured from the visible
+    # area, which already excludes the Dock.
     BOTTOM_MARGIN = 54
     PULSE_INTERVAL = 0.5
 
@@ -707,15 +920,66 @@ class FloatingOverlay:
     RECORDING = (1.00, 0.23, 0.19)  # red
     TRANSCRIBING = (1.00, 0.72, 0.00)  # amber
 
-    def __init__(self, enabled: bool = True):
+    def __init__(self, settings: Settings):
+        self.settings = settings
         self._window = None
         self._layer = None
         self._pulse_running = False
         self._pulse_thread: threading.Thread | None = None
         self._alpha_high = True
-        if not enabled or not HAS_COCOA:
+        if not settings.overlay or not HAS_COCOA:
             return
         self._build_window()
+
+    # ── positioning ──────────────────────────────────────────────────────────
+
+    def _bottom_origin(self) -> tuple[float, float] | None:
+        """The fixed fallback: bottom-centre of the primary screen."""
+        screens = _screens()
+        if not screens:
+            return None
+        _, visible = screens[0]
+        vx, vy, vw, _ = visible
+        return (vx + (vw - self.DOT_SIZE) / 2.0, vy + self.BOTTOM_MARGIN)
+
+    def _origin_for(self, caret_rect) -> tuple[float, float] | None:
+        """
+        Where the dot should sit, in Cocoa coordinates.
+
+        Tries in order: the text cursor, the mouse pointer, the bottom of the
+        screen. Which rungs are used depends on `overlay_anchor`.
+        """
+        anchor = self.settings.overlay_anchor
+        dx = self.settings.overlay_offset_x
+        dy = self.settings.overlay_offset_y
+        half = self.DOT_SIZE / 2.0
+
+        if anchor == "caret" and caret_rect:
+            ax_x, ax_y, ax_w, ax_h = caret_rect
+            x = ax_x + ax_w + dx
+            y = ax_y_to_cocoa_y(ax_y, ax_h, primary_screen_height()) - half + dy
+            frame = visible_frame_for_point(x, y)
+            return clamp_to_frame(x, y, self.DOT_SIZE, frame) if frame else (x, y)
+
+        if anchor in ("caret", "mouse"):
+            point = mouse_screen_point()
+            if point:
+                # Below and right of the pointer, so it does not sit under the
+                # arrow itself.
+                x = point[0] + dx
+                y = point[1] - self.DOT_SIZE - abs(dy or 4)
+                frame = visible_frame_for_point(x, y)
+                return clamp_to_frame(x, y, self.DOT_SIZE, frame) if frame else (x, y)
+
+        return self._bottom_origin()
+
+    def move_to(self, caret_rect=None) -> None:
+        """Reposition the dot. Main thread only — call via run_on_main()."""
+        if not self._window:
+            return
+        origin = self._origin_for(caret_rect)
+        if origin:
+            self._window.setFrameOrigin_(NSMakePoint(origin[0], origin[1]))
 
     def _build_window(self) -> None:
         """Create the borderless click-through dot window."""
@@ -757,12 +1021,13 @@ class FloatingOverlay:
         color = NSColor.colorWithCalibratedRed_green_blue_alpha_(*rgb, 1.0)
         self._layer.setBackgroundColor_(color.CGColor())
 
-    def show_recording(self) -> None:
-        """Show a breathing red dot."""
+    def show_recording(self, caret_rect=None) -> None:
+        """Show a breathing red dot, next to where the text will land."""
         if not self._window:
             return
 
         def _do_show():
+            self.move_to(caret_rect)
             self._apply_color(self.RECORDING)
             self._window.setAlphaValue_(self.ALPHA_HIGH)
             self._window.orderFrontRegardless()
@@ -974,6 +1239,7 @@ class DictationEngine:
         self._active_trigger = None  # which key owns the current hold
         self._threshold_timer: threading.Timer | None = None
         self._target_app: tuple[str | None, str | None] = (None, None)
+        self._caret_rect = None
         self._enabled = True
 
     # ── state ────────────────────────────────────────────────────────────────
@@ -985,7 +1251,7 @@ class DictationEngine:
 
         if self.overlay:
             if new_state == self.RECORDING:
-                self.overlay.show_recording()
+                self.overlay.show_recording(self._caret_rect)
             elif new_state == self.TRANSCRIBING:
                 self.overlay.show_transcribing()
             else:
@@ -1022,6 +1288,14 @@ class DictationEngine:
         # you were in when you started talking, and it is the app the text will
         # land in. Cheap enough to do on the key path.
         self._target_app = frontmost_app()
+
+        # And where its text cursor is, for the same reason — this is the last
+        # moment before anything can steal focus. Bounded by AX_TIMEOUT, and
+        # returns None rather than raising, so a slow app costs a fallback
+        # position and never a missed recording.
+        self._caret_rect = (
+            caret_screen_rect() if self.settings.overlay_anchor == "caret" else None
+        )
 
         self._set_state(self.WAITING)
 
@@ -1208,6 +1482,7 @@ class WhisperLocalApp(rumps.App):
         menu += [
             None,
             self.toggle_item,
+            rumps.MenuItem("Permissions…", callback=self._permissions),
             None,
             rumps.MenuItem("Quit", callback=self._quit),
         ]
@@ -1280,6 +1555,18 @@ class WhisperLocalApp(rumps.App):
             self.status_item.title = "Disabled"
             print("Dictation disabled")
 
+    def _permissions(self, sender) -> None:
+        """Re-check permissions on demand, and say so when nothing is missing."""
+        missing = missing_permissions(self.settings)
+        if missing:
+            prompt_for_permissions(missing)
+        else:
+            rumps.alert(
+                title="WhisperLocal — permissions",
+                message="Everything WhisperLocal needs has been granted.",
+                ok="Good",
+            )
+
     def _reveal_history(self, sender) -> None:
         """Show the history file in Finder."""
         path = self.settings.history_path
@@ -1300,6 +1587,100 @@ class WhisperLocalApp(rumps.App):
     def _quit(self, sender) -> None:
         print("WhisperLocal shutting down")
         rumps.quit_application()
+
+
+# ─── Permissions ─────────────────────────────────────────────────────────────────
+
+PANE = "x-apple.systempreferences:com.apple.preference.security"
+PERMISSION_PANES = {
+    "Accessibility": f"{PANE}?Privacy_Accessibility",
+    "Input Monitoring": f"{PANE}?Privacy_ListenEvent",
+    "Microphone": f"{PANE}?Privacy_Microphone",
+}
+
+
+def open_permission_pane(name: str) -> None:
+    """Open one System Settings privacy pane."""
+    link = PERMISSION_PANES.get(name)
+    if link:
+        subprocess.Popen(["open", link])
+
+
+def missing_permissions(settings: Settings) -> list[str]:
+    """
+    Which permissions still need a manual toggle.
+
+    Microphone is not listed: macOS prompts for it natively the first time we
+    open the input stream, and the bundle's NSMicrophoneUsageDescription
+    supplies the explanation. Accessibility and Input Monitoring have no such
+    prompt — the user has to find them in System Settings, which is exactly why
+    this exists.
+    """
+    missing = []
+
+    try:
+        from ApplicationServices import AXIsProcessTrusted
+
+        if not AXIsProcessTrusted():
+            missing.append("Accessibility")
+    except ImportError:
+        pass
+
+    if settings.uses_fn and HAS_EVENT_TAP:
+        tap = CGEventTapCreate(
+            kCGSessionEventTap,
+            kCGHeadInsertEventTap,
+            kCGEventTapOptionListenOnly,
+            CGEventMaskBit(kCGEventFlagsChanged),
+            lambda *a: None,
+            None,
+        )
+        if not tap:
+            missing.append("Input Monitoring")
+
+    return missing
+
+
+def prompt_for_permissions(missing: list[str]) -> None:
+    """
+    Ask for the permissions that macOS will not prompt for on its own.
+
+    Shown once per launch and only while something is actually missing, so it
+    stops appearing as soon as the user has granted everything.
+    """
+    if not missing:
+        return
+
+    why = {
+        "Accessibility": "to paste transcribed text at your cursor",
+        "Input Monitoring": "to notice the trigger key while another app is focused",
+    }
+    lines = [f"• {name} — {why.get(name, '')}" for name in missing]
+
+    message = (
+        "WhisperLocal needs "
+        + ("a permission" if len(missing) == 1 else "some permissions")
+        + " that macOS only grants by hand:\n\n"
+        + "\n".join(lines)
+        + "\n\nOpen Settings and switch WhisperLocal on, then quit and reopen it "
+        "from the menu bar.\n\nDictation will not work until you do."
+    )
+
+    def _ask():
+        try:
+            response = rumps.alert(
+                title="WhisperLocal — one more step",
+                message=message,
+                ok="Open Settings",
+                cancel="Later",
+            )
+            if response:
+                for name in missing:
+                    open_permission_pane(name)
+        except Exception as exc:
+            print(f"Warning: could not show the permissions prompt: {exc}")
+
+    run_on_main(_ask)
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────────
@@ -1355,7 +1736,7 @@ def run(settings: Settings) -> int:
     print()
 
     transcriber = Transcriber(settings)
-    overlay = FloatingOverlay(enabled=settings.overlay)
+    overlay = FloatingOverlay(settings)
     sounds = Sounds(enabled=settings.sounds)
     engine = DictationEngine(transcriber, settings, overlay=overlay, sounds=sounds)
 
@@ -1409,7 +1790,25 @@ def run(settings: Settings) -> int:
 
     print("Menu bar app starting...")
     print()
-    WhisperLocalApp(engine, settings).run()
+
+    app = WhisperLocalApp(engine, settings)
+
+    # Ask for anything macOS will not prompt for on its own, once the menu bar
+    # exists so the alert has an app to belong to.
+    missing = missing_permissions(settings)
+    if missing:
+        print(f"Missing permissions: {', '.join(missing)}")
+
+        # A short delay so the menu bar item is up before the alert appears.
+        # The timer stops itself — rumps timers otherwise repeat forever, and
+        # nobody wants this dialog every second.
+        def _prompt_once(timer):
+            timer.stop()
+            prompt_for_permissions(missing)
+
+        rumps.Timer(_prompt_once, 1).start()
+
+    app.run()
     return 0
 
 

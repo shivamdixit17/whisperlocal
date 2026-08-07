@@ -144,6 +144,18 @@ class Settings:
     sounds: bool = True
     overlay: bool = True
 
+    # Where the recording dot appears.
+    #   "caret"  — beside the text cursor, so it is wherever you are typing
+    #   "mouse"  — beside the mouse pointer
+    #   "bottom" — fixed above the Dock
+    # "caret" falls back to the pointer, and then to the bottom, because plenty
+    # of apps never report their cursor position to macOS.
+    overlay_anchor: str = "caret"
+
+    # Nudge from the anchor, so the dot does not sit on top of your text.
+    overlay_offset_x: int = 14
+    overlay_offset_y: int = 0
+
     # ── Hallucination guard ──────────────────────────────────────────────────
     # Whisper falls into a decoder repetition loop on short or noisy audio and
     # emits one word over and over. Observed: "ARP" x112, "funny" x223 and
@@ -347,6 +359,12 @@ def validate(settings: Settings) -> None:
     if len(set(settings.trigger_keys)) != len(settings.trigger_keys):
         raise ConfigError("trigger_keys: the same key is listed more than once")
 
+    if settings.overlay_anchor not in ("caret", "mouse", "bottom"):
+        raise ConfigError(
+            f"overlay_anchor: {settings.overlay_anchor!r} is not supported. "
+            "Choose 'caret', 'mouse' or 'bottom'."
+        )
+
     if settings.paste_mode not in ("paste", "clipboard"):
         raise ConfigError(
             f"paste_mode: {settings.paste_mode!r} is not supported. "
@@ -527,8 +545,23 @@ paste_mode = "paste"
 # System sounds on start, stop, success and failure.
 sounds = true
 
-# The small pulsing dot near the bottom of the screen while recording.
+# The small pulsing dot shown while recording.
 overlay = true
+
+# Where that dot appears:
+#   "caret"  — right beside your text cursor, so it is wherever you are typing
+#   "mouse"  — beside the mouse pointer
+#   "bottom" — fixed above the Dock
+#
+# "caret" needs the app you are typing in to report its cursor position to
+# macOS. Most native apps do; many Electron apps and some browser fields do
+# not, and those fall back to the mouse pointer automatically. Run
+# `whisperlocal probe-caret` to see what a particular app reports.
+overlay_anchor = "caret"
+
+# Nudge the dot away from the anchor so it does not cover your text.
+overlay_offset_x = 14
+overlay_offset_y = 0
 
 # ─── Dictation history ──────────────────────────────────────────────────────
 # Every dictation, successful or not, is appended to a JSONL file. This is what

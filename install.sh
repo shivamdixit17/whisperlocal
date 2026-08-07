@@ -91,35 +91,54 @@ install_tool() {
     ok "WhisperLocal installed"
 }
 
+# ── The app bundle: what makes this work without a terminal ──────────────────
+# Installs ~/Applications/WhisperLocal.app, registers it to start at login and
+# launches it. The bundle also becomes the owner of the macOS permissions, so
+# they stop being attached to whichever terminal happened to start it.
+install_app() {
+    info "Setting up the menu bar app..."
+    if whisperlocal install-app 2>&1 | sed 's/^/    /'; then
+        ok "Menu bar app installed and running"
+    else
+        warn "Could not install the app bundle. WhisperLocal still works from"
+        printf "    the terminal by running: whisperlocal\n"
+    fi
+}
+
 post_install() {
-    printf "\n%sOne thing left: permissions.%s\n\n" "$BOLD" "$RESET"
+    printf "\n%sOne thing left: two permissions.%s\n\n" "$BOLD" "$RESET"
     cat <<'EOF'
-macOS grants these to the app that LAUNCHES WhisperLocal — your terminal —
-not to WhisperLocal itself. Open System Settings → Privacy & Security and
-add your terminal to all three:
+WhisperLocal is running now — look for the icon in your menu bar. It has
+already asked, or is about to ask, for these two. macOS has no way for an app
+to grant them itself; you have to switch them on by hand, once:
 
-   • Input Monitoring   so it can see the trigger while other apps are focused,
-                        and create the Fn event tap
-   • Microphone         so it can hear you
-   • Accessibility      so it can paste the text at your cursor
+   • Accessibility      to paste transcribed text at your cursor
+   • Input Monitoring   to notice the trigger key in other apps
 
-Then quit and reopen your terminal for them to take effect.
+The app will open the right Settings pane for you. Switch "WhisperLocal" on
+in each, then quit and reopen it from the menu bar.
+
+The microphone is different — macOS will prompt you for that by itself the
+first time you dictate.
 
 EOF
-    printf "%sVerify everything:%s  whisperlocal doctor\n" "$BOLD" "$RESET"
-    printf "%sStart dictating:%s    whisperlocal\n\n" "$BOLD" "$RESET"
+    printf "%sThat is it.%s It starts automatically at login from now on.\n" "$BOLD" "$RESET"
+    printf "You never need the terminal again.\n\n"
     printf "%sHold the Fn (globe) key, speak, let go.%s\n\n" "$DIM" "$RESET"
-
-    if ! command -v whisperlocal &>/dev/null; then
-        warn "'whisperlocal' is not on your PATH yet — open a new terminal, or run:"
-        printf "    export PATH=\"\$HOME/.local/bin:\$PATH\"\n\n"
-    fi
+    printf "%sIf anything misbehaves:%s  whisperlocal doctor\n" "$DIM" "$RESET"
+    printf "%sLogs:%s                   ~/Library/Logs/WhisperLocal.log\n\n" "$DIM" "$RESET"
 }
 
 # ── Uninstall ────────────────────────────────────────────────────────────────
 uninstall() {
     banner "Uninstall"
     ensure_path
+
+    # Stop it, unregister the login item and delete the bundle, while the
+    # command that knows how to do that still exists.
+    if command -v whisperlocal &>/dev/null; then
+        whisperlocal uninstall-app 2>&1 | sed 's/^/    /' || true
+    fi
 
     if command -v uv &>/dev/null && uv tool list 2>/dev/null | grep -q "^${TOOL_NAME}"; then
         uv tool uninstall "$TOOL_NAME" >/dev/null 2>&1 && ok "Removed the whisperlocal command"
@@ -193,6 +212,7 @@ EOF
             ensure_uv
             ensure_ffmpeg
             install_tool
+            install_app
             post_install
             ;;
         *)
