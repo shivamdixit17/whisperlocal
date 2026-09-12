@@ -46,8 +46,12 @@ dependencies = [
     "rumps>=0.4",
     "pyobjc-framework-Cocoa>=10",
     "pyobjc-framework-ApplicationServices>=10",
+    "pyobjc-framework-CoreAudio>=10",
     "numpy>=2",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
 
 [project.urls]
 Homepage = "https://github.com/shivamdixit17/whisperlocal"

@@ -18,7 +18,9 @@ import threading
 import time
 
 from whisperlocal import config as cfg
+from whisperlocal import keymap
 from whisperlocal.config import FN_KEY, Settings
+from whisperlocal.settings_manager import SettingsManager, Tier
 
 # ─── Imports with friendly error messages ────────────────────────────────────────
 
@@ -35,9 +37,9 @@ def _check_import(module_name: str, pip_name: str | None = None):
         sys.exit(1)
 
 
-np = _check_import("numpy")
-sounddevice = _check_import("sounddevice")
-sf = _check_import("soundfile")
+_check_import("numpy")
+_check_import("sounddevice")
+_check_import("soundfile")
 pyperclip = _check_import("pyperclip")
 rumps = _check_import("rumps")
 _check_import("pynput.keyboard", "pynput")
@@ -113,8 +115,10 @@ except ImportError:  # pragma: no cover
 # the only way to trigger on it is to read the raw modifier flags.
 try:
     from CoreFoundation import (
+        CFMachPortInvalidate,
         CFRunLoopAddSource,
         CFRunLoopGetMain,
+        CFRunLoopRemoveSource,
         kCFRunLoopCommonModes,
     )
     from Quartz import (
@@ -234,6 +238,8 @@ class HistoryLog:
         transcribe_ms: float | None = None,
         app: str | None = None,
         app_bundle_id: str | None = None,
+        backend: str = "local",
+        model: str | None = None,
     ) -> None:
         if not self.enabled:
             return
@@ -252,7 +258,8 @@ class HistoryLog:
             "wpm": round(words / (audio_seconds / 60), 1) if words and audio_seconds > 0 else None,
             "app": app,
             "app_bundle_id": app_bundle_id,
-            "model": self.settings.model_path,
+            "model": model or self.settings.model_path,
+            "backend": backend,
         }
 
         try:
@@ -473,6 +480,26 @@ class FnKeyListener:
         CGEventTapEnable(self._tap, True)
         return True
 
+    def stop(self) -> None:
+        """Detach the tap. Must run on the main thread, like start()."""
+        if self._tap is None:
+            return
+        try:
+            CGEventTapEnable(self._tap, False)
+            if self._source is not None:
+                CFRunLoopRemoveSource(CFRunLoopGetMain(), self._source, kCFRunLoopCommonModes)
+            CFMachPortInvalidate(self._tap)
+        except Exception as exc:
+            print(f"Warning: could not detach the Fn event tap cleanly: {exc}")
+        finally:
+            self._tap = None
+            self._source = None
+            self._down = False
+
+    @property
+    def active(self) -> bool:
+        return self._tap is not None
+
 
 # ─── Audio feedback ──────────────────────────────────────────────────────────────
 
@@ -487,9 +514,12 @@ class Sounds:
 
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
+        # Set while a meeting is being recorded: the system-audio tap would
+        # otherwise capture our own Tink and Pop.
+        self.suppressed = False
 
     def play(self, name: str) -> None:
-        if not self.enabled:
+        if not self.enabled or self.suppressed:
             return
         path = f"/System/Library/Sounds/{name}.aiff"
         if os.path.exists(path):
@@ -510,288 +540,14 @@ class Sounds:
         self.play(self.ERROR)
 
 
-# ─── Whisper transcriber ─────────────────────────────────────────────────────────
-
-
-class Transcriber:
-    """Manages the mlx-whisper model."""
-
-    def __init__(self, settings: Settings):
-        self.settings = settings
-        self.model_path = settings.model_path
-        self._mlx_whisper = None
-        self._loaded = False
-        self._release_timer: threading.Timer | None = None
-
-    def _ensure_loaded(self) -> None:
-        """Import mlx_whisper on first use — it is slow to load."""
-        if self._loaded:
-            return
-        print("Loading mlx-whisper...")
-        try:
-            import mlx_whisper
-        except ImportError:
-            print("Error: mlx-whisper is not installed. Run: pip install mlx-whisper")
-            sys.exit(1)
-        self._mlx_whisper = mlx_whisper
-        self._loaded = True
-        self._apply_cache_limit()
-        print(f"mlx-whisper loaded. Model: {self.model_path}")
-        print("   (Weights download on first use — the first run takes longer.)")
-
-    # ── memory ───────────────────────────────────────────────────────────────
-
-    def _apply_cache_limit(self) -> None:
-        """
-        Cap MLX's buffer cache.
-
-        MLX holds freed GPU buffers for reuse and, unbounded, that reaches about
-        a gigabyte after a few dictations and stays there. The model itself is
-        only ~140 MB of it. Capping the cache costs tens of milliseconds per
-        dictation and roughly halves the memory this process reports.
-        """
-        limit = self.settings.mlx_cache_mb
-        if limit < 0:
-            return
-        try:
-            import mlx.core as mx
-
-            mx.set_cache_limit(limit * 2**20)
-        except Exception as exc:
-            print(f"Warning: could not set the MLX cache limit: {exc}")
-
-    def release_memory(self) -> None:
-        """Drop the buffer cache entirely. Costs the next dictation a little."""
-        try:
-            import mlx.core as mx
-
-            mx.clear_cache()
-        except Exception:
-            pass
-
-    def _schedule_release(self) -> None:
-        """
-        Drop the cache once dictation has stopped for a while.
-
-        Dictation is bursty: a flurry of sentences, then nothing for an hour.
-        Keeping the cache during the burst keeps it fast, and releasing it
-        afterwards keeps the idle app from parking hundreds of megabytes it is
-        not using.
-        """
-        seconds = self.settings.idle_release_seconds
-        if seconds <= 0:
-            return
-
-        if self._release_timer:
-            self._release_timer.cancel()
-
-        self._release_timer = threading.Timer(seconds, self.release_memory)
-        self._release_timer.daemon = True
-        self._release_timer.start()
-
-    def memory_report(self) -> dict:
-        """Current MLX memory use, in MB. Empty if MLX is not loaded."""
-        try:
-            import mlx.core as mx
-
-            return {
-                "active": mx.get_active_memory() // 2**20,
-                "cache": mx.get_cache_memory() // 2**20,
-                "peak": mx.get_peak_memory() // 2**20,
-            }
-        except Exception:
-            return {}
-
-    def transcribe(self, audio_path) -> str | None:
-        """Transcribe an audio file. None if anything went wrong."""
-        self._ensure_loaded()
-        try:
-            result = self._mlx_whisper.transcribe(
-                str(audio_path),
-                path_or_hf_repo=self.model_path,
-                language=self.settings.whisper_language,
-                fp16=self.settings.fp16,
-            )
-            return result.get("text", "").strip()
-        except Exception as exc:
-            print(f"Error: transcription failed: {exc}")
-            return None
-        finally:
-            self._schedule_release()
-
-    def transcribe_words(self, audio, model_path: str | None = None):
-        """Transcribe an audio array and return [(word, start, end), ...].
-
-        Takes no prompt, deliberately. Passing previously transcribed text back
-        in as `initial_prompt` creates a positive feedback loop: on near-silence
-        the model simply continues the prompt, so one bad chunk primes the next
-        and the session degenerates into a single token repeated forever
-        ("ARP ARP ARP..."). Reproduced exactly — 2.5s of room tone with such a
-        prompt yields 112 words of "ARP" in 1650ms; the same audio with no
-        prompt yields nothing in 97ms.
-
-        condition_on_previous_text is off for the same reason, guarding against
-        a spiral within a single chunk.
-        """
-        self._ensure_loaded()
-        try:
-            result = self._mlx_whisper.transcribe(
-                audio,
-                path_or_hf_repo=model_path or self.model_path,
-                language=self.settings.whisper_language,
-                fp16=self.settings.fp16,
-                word_timestamps=True,
-                condition_on_previous_text=False,
-            )
-        except Exception as exc:
-            print(f"Error: transcription failed: {exc}")
-            return None
-
-        return [
-            (w["word"], w["start"], w["end"])
-            for segment in result.get("segments", [])
-            for w in (segment.get("words") or [])
-        ]
-
-
-# ─── Audio recorder ──────────────────────────────────────────────────────────────
-
-
-class AudioRecorder:
-    """Records audio from the default microphone."""
-
-    BLOCKSIZE = 1024
-
-    def __init__(self, settings: Settings):
-        self.settings = settings
-        self._frames: list = []
-        self._stream = None
-        self._recording = False
-        self._start_time: float | None = None
-        self._thread: threading.Thread | None = None
-        self._samplerate = settings.sample_rate
-        # Guards _frames. The drain thread appends to it while a live
-        # dictation worker reads and trims it.
-        self._lock = threading.Lock()
-
-    def _device_samplerate(self) -> int:
-        """Native sample rate of the default input device.
-
-        Asking PortAudio for a rate the hardware doesn't run at (16 kHz on a mic
-        that runs at 48 kHz) forces it through its rate-adapting code path, which
-        segfaults on CoreAudio's realtime thread. Record at the native rate
-        instead; whisper's ffmpeg loader downsamples to 16 kHz when it reads the
-        file, so nothing downstream cares.
-        """
-        try:
-            return int(sounddevice.query_devices(kind="input")["default_samplerate"])
-        except Exception:
-            return self.settings.sample_rate
-
-    def start(self) -> None:
-        """Open the microphone and start collecting frames."""
-        with self._lock:
-            self._frames = []
-        self._recording = True
-        self._start_time = time.time()
-        self._samplerate = self._device_samplerate()
-
-        self._stream = sounddevice.InputStream(
-            samplerate=self._samplerate,
-            channels=self.settings.channels,
-            dtype="float32",
-            blocksize=self.BLOCKSIZE,
-        )
-        self._stream.start()
-
-        # Drain the stream from a thread we own. Handing a Python callback to
-        # PortAudio runs the interpreter on CoreAudio's realtime IO thread and
-        # crashes there (EXC_BAD_ACCESS in _PyEval_EvalFrameDefault, via cffi's
-        # closure trampoline).
-        def _drain():
-            while self._recording:
-                try:
-                    data, overflowed = self._stream.read(self.BLOCKSIZE)
-                except Exception as exc:
-                    print(f"Warning: audio read error: {exc}")
-                    break
-                if overflowed:
-                    print("Warning: audio buffer overflow")
-                with self._lock:
-                    self._frames.append(data.copy())
-
-        self._thread = threading.Thread(target=_drain, daemon=True)
-        self._thread.start()
-        print("Recording...")
-
-    def stop(self) -> float:
-        """Close the microphone and return how long we recorded for."""
-        self._recording = False
-
-        # Join before closing: the drain thread must not be inside read() when
-        # the stream goes away.
-        if self._thread:
-            self._thread.join(timeout=2.0)
-            self._thread = None
-
-        if self._stream:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
-
-        duration = time.time() - self._start_time if self._start_time else 0.0
-        self._start_time = None
-        print(f"Recording stopped ({duration:.1f}s)")
-        return duration
-
-    def snapshot(self):
-        """Everything captured so far, without stopping the recording.
-
-        Live dictation re-transcribes the buffer while it is still filling.
-        """
-        with self._lock:
-            frames = list(self._frames)
-        if not frames:
-            return np.zeros(0, dtype="float32"), self._samplerate
-        return np.concatenate(frames, axis=0), self._samplerate
-
-    def drop_leading(self, seconds: float) -> float:
-        """Discard `seconds` of audio from the front of the buffer.
-
-        Keeps live sessions inside whisper's 30s attention window, beyond which
-        inference cost triples. Frames are fixed-size so this rounds down to a
-        whole number of them, and returns how much was actually dropped so the
-        caller can keep its own timeline in sync.
-        """
-        if seconds <= 0:
-            return 0.0
-
-        with self._lock:
-            if not self._frames:
-                return 0.0
-            frames_to_drop = int(seconds * self._samplerate) // self.BLOCKSIZE
-            frames_to_drop = min(frames_to_drop, len(self._frames))
-            if frames_to_drop <= 0:
-                return 0.0
-            del self._frames[:frames_to_drop]
-
-        return frames_to_drop * self.BLOCKSIZE / self._samplerate
-
-    def save(self, filepath) -> bool:
-        """Write the captured audio to a WAV file."""
-        with self._lock:
-            frames = list(self._frames)
-        if not frames:
-            return False
-
-        audio_data = np.concatenate(frames, axis=0)
-        filepath.parent.mkdir(parents=True, exist_ok=True)
-        sf.write(str(filepath), audio_data, self._samplerate)
-        return True
-
-    @property
-    def is_recording(self) -> bool:
-        return self._recording
+# ─── Engine pieces that live in their own modules ────────────────────────────────
+# Re-exported so `from whisperlocal.app import Transcriber` keeps working.
+from whisperlocal.audio import AudioRecorder  # noqa: E402
+from whisperlocal.meetingdetect import DetectedMeeting, MeetingDetector  # noqa: E402
+from whisperlocal.meetingrecorder import MeetingRecorder  # noqa: E402
+from whisperlocal.meetings import MeetingStore  # noqa: E402
+from whisperlocal.transcription.backends import BackendError, make_backend  # noqa: E402
+from whisperlocal.transcription.local import Transcriber  # noqa: E402
 
 
 # ─── Delivering the text ─────────────────────────────────────────────────────────
@@ -1040,6 +796,22 @@ class FloatingOverlay:
 
         return self._bottom_origin()
 
+    def apply_settings(self, settings: Settings) -> None:
+        """Pick up new settings. Anchor and offsets are read on every move, so
+        only turning the overlay on or off needs work here."""
+        self.settings = settings
+
+        def _apply():
+            if settings.overlay and HAS_COCOA and not self._window:
+                self._build_window()
+            elif not settings.overlay and self._window:
+                self._stop_pulse()
+                self._window.orderOut_(None)
+                self._window = None
+                self._layer = None
+
+        run_on_main(_apply)
+
     def move_to(self, caret_rect=None) -> None:
         """Reposition the dot. Main thread only — call via run_on_main()."""
         if not self._window:
@@ -1264,6 +1036,115 @@ class MouseTriggerListener:
         self._listener.start()
         return True
 
+    def stop(self) -> None:
+        if self._listener:
+            try:
+                self._listener.stop()
+            except Exception:
+                pass
+            self._listener = None
+        self._down_token = None
+        self._origin = None
+
+
+class TriggerListeners:
+    """The three trigger listeners as one unit, so the Settings page can swap
+    the trigger keys without a restart.
+
+    start(), stop() and restart() must run on the main thread: the Fn tap is
+    attached to the main runloop, and pynput listeners are stopped from outside
+    their own thread.
+    """
+
+    def __init__(self, engine: "DictationEngine"):
+        self.engine = engine
+        self.fn: FnKeyListener | None = None
+        self.keyboard = None
+        self.mouse: MouseTriggerListener | None = None
+        self.settings: Settings | None = None
+
+    def start(self, settings: Settings) -> bool:
+        """Start every listener the config asks for. True if any started."""
+        self.settings = settings
+        engine = self.engine
+        started_any = False
+
+        if settings.uses_fn:
+            self.fn = FnKeyListener(engine.on_key_press, engine.on_key_release)
+            if self.fn.start():
+                print("Fn listener started")
+                started_any = True
+            else:
+                print("Error: could not start the Fn listener")
+                self.fn = None
+
+        if settings.pynput_keys:
+            self.keyboard = Listener(on_press=engine.on_key_press, on_release=engine.on_key_release)
+            self.keyboard.daemon = True
+            self.keyboard.start()
+            print(f"Key listener started ({', '.join(settings.pynput_keys)})")
+            started_any = True
+
+        if settings.mouse_buttons:
+            self.mouse = MouseTriggerListener(
+                settings,
+                on_press=engine.on_key_press,
+                on_release=engine.on_key_release,
+                on_cancel=engine.cancel_trigger,
+            )
+            if self.mouse.start():
+                print(
+                    f"Mouse listener started ({', '.join(settings.mouse_buttons)}, "
+                    f"hold {settings.mouse_hold_threshold}s)"
+                )
+                started_any = True
+            else:
+                self.mouse = None
+
+        if not started_any:
+            print("Error: no trigger listener could start — dictation will not fire.")
+            print("   Grant Input Monitoring to WhisperLocal, then try again.")
+        return started_any
+
+    def stop(self) -> None:
+        if self.fn:
+            self.fn.stop()
+            self.fn = None
+            print("Fn listener stopped")
+        if self.keyboard:
+            try:
+                self.keyboard.stop()
+            except Exception:
+                pass
+            self.keyboard = None
+            print("Key listener stopped")
+        if self.mouse:
+            self.mouse.stop()
+            self.mouse = None
+            print("Mouse listener stopped")
+
+    def restart(self, settings: Settings) -> bool:
+        """Swap to a new trigger set. Cuts short a recording in progress."""
+        engine = self.engine
+        if engine.state != engine.IDLE:
+            engine.enabled = False
+            engine.enabled = True
+        self.stop()
+        engine.trigger_tokens = resolve_trigger_tokens(settings)
+        return self.start(settings)
+
+    @property
+    def fn_active(self) -> bool:
+        return bool(self.fn and self.fn.active)
+
+    def describe(self) -> dict:
+        s = self.settings
+        return {
+            "fn": self.fn_active,
+            "keys": list(s.pynput_keys) if (s and self.keyboard) else [],
+            "mouse": list(s.mouse_buttons) if (s and self.mouse) else [],
+        }
+
 
 # ─── The state machine ───────────────────────────────────────────────────────────
 
@@ -1302,6 +1183,11 @@ class DictationEngine:
         self.state = self.IDLE
         self.last_transcription = ""
         self.trigger_tokens = resolve_trigger_tokens(settings)
+        self.backend = make_backend(settings, "dictation", transcriber=transcriber)
+
+        # While the Settings page is listening for a new trigger key, every
+        # press goes to this hook instead of starting a recording.
+        self.capture_hook = None
 
         self._active_trigger = None  # which key owns the current hold
         self._threshold_timer: threading.Timer | None = None
@@ -1335,8 +1221,31 @@ class DictationEngine:
             return key
         return None
 
+    def apply_settings(self, settings: Settings) -> None:
+        """Pick up new settings without a restart.
+
+        Everything downstream reads `self.settings.<field>` at the moment it
+        needs it, so swapping the reference is most of the work. The few things
+        built from settings at construction time are rebuilt here.
+        """
+        self.settings = settings
+        self.recorder.settings = settings
+        self.sounds.enabled = settings.sounds
+        self.history = HistoryLog(settings)
+        self.trigger_tokens = resolve_trigger_tokens(settings)
+        self.transcriber.apply_settings(settings)
+        self.backend = make_backend(settings, "dictation", transcriber=self.transcriber)
+        if self.overlay:
+            self.overlay.apply_settings(settings)
+
     def on_key_press(self, key=None) -> None:
         """Start the hold timer when a trigger key goes down."""
+        if self.capture_hook is not None:
+            # Only the Fn tap has to be shared: KeyCapture runs its own
+            # keyboard and mouse listeners, so everything else is dropped.
+            if key == FN_KEY:
+                self.capture_hook(key, True)
+            return
         if not self._enabled:
             return
 
@@ -1402,6 +1311,10 @@ class DictationEngine:
 
     def on_key_release(self, key=None) -> None:
         """Cancel a short tap, or finish a real recording."""
+        if self.capture_hook is not None:
+            if key == FN_KEY:
+                self.capture_hook(key, False)
+            return
         token = self._identify(key)
         if token is None or token != self._active_trigger:
             # Either not a trigger at all, or a different trigger key than the
@@ -1460,12 +1373,25 @@ class DictationEngine:
         self._set_state(self.TRANSCRIBING)
 
         def _do_transcribe():
+            backend = self.backend
             t0 = time.perf_counter()
-            text = self.transcriber.transcribe(audio_file)
-            elapsed_ms = (time.perf_counter() - t0) * 1000
-
             status = "ok"
-            if text and looks_degenerate(text, self.settings):
+            text = None
+            try:
+                text = backend.transcribe_file(
+                    audio_file, language=self.settings.whisper_language, timestamps=False
+                ).text
+            except BackendError as exc:
+                print(f"Error: {backend.name} backend failed: {exc} — nothing pasted")
+                self.sounds.error()
+                status = "backend_error"
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            if backend.name != "local":
+                print(f"   Transcribed via {backend.name} ({backend.model}) in {elapsed_ms:.0f} ms")
+
+            if status != "ok":
+                pass
+            elif text and looks_degenerate(text, self.settings):
                 # Whisper loops on short or noisy audio and emits one word
                 # hundreds of times. Better to paste nothing than to dump that
                 # into whatever you had focused.
@@ -1484,6 +1410,8 @@ class DictationEngine:
                 transcribe_ms=elapsed_ms,
                 app=app,
                 app_bundle_id=bundle,
+                backend=backend.name,
+                model=backend.model,
             )
 
             if status == "ok":
@@ -1518,16 +1446,187 @@ class DictationEngine:
             self._set_state(self.IDLE)
 
 
+# ─── Trigger key capture (for the Settings page) ─────────────────────────────────
+
+
+class KeyCapture:
+    """
+    "Press the key you want to dictate with."
+
+    Runs its own keyboard and mouse listeners for the duration, so any button
+    at all can be offered, and borrows the app's Fn tap through the engine's
+    capture hook (or starts a temporary one when Fn is not a trigger). While
+    it is listening the engine drops every press, so trying keys out does not
+    start recordings.
+
+    A mouse button only counts if held for MOUSE_HOLD — the click on the
+    "Record key" button itself, and any stray click, is ignored.
+    """
+
+    TIMEOUT = 10.0
+    MOUSE_HOLD = 0.6
+
+    def __init__(self, engine: DictationEngine, listeners: TriggerListeners):
+        self.engine = engine
+        self.listeners = listeners
+        self._lock = threading.Lock()
+        self._state: dict = {"state": "idle"}
+        self._deadline = 0.0
+        self._keyboard = None
+        self._mouse = None
+        self._fn: FnKeyListener | None = None
+        self._timer: threading.Timer | None = None
+        self._mouse_down: tuple[str, float] | None = None
+        self._fn_down_at: float | None = None
+
+    # ── public ───────────────────────────────────────────────────────────
+
+    def start(self) -> dict:
+        with self._lock:
+            self._teardown_locked()
+            self._state = {"state": "waiting"}
+            self._deadline = time.time() + self.TIMEOUT
+            self.engine.capture_hook = self._on_fn
+
+            from pynput import keyboard, mouse
+
+            self._keyboard = keyboard.Listener(on_press=self._on_key)
+            self._keyboard.daemon = True
+            self._keyboard.start()
+            self._mouse = mouse.Listener(on_click=self._on_click)
+            self._mouse.daemon = True
+            self._mouse.start()
+
+            if not self.listeners.fn_active and HAS_EVENT_TAP:
+                fn = FnKeyListener(lambda k: self._on_fn(k, True), lambda k: self._on_fn(k, False))
+                self._fn = fn
+                run_on_main(fn.start)
+
+            self._timer = threading.Timer(self.TIMEOUT, lambda: self._finish("timeout"))
+            self._timer.daemon = True
+            self._timer.start()
+        return self.state()
+
+    def state(self) -> dict:
+        with self._lock:
+            out = dict(self._state)
+            if out["state"] in ("waiting", "unsupported"):
+                out["seconds_left"] = max(0, round(self._deadline - time.time(), 1))
+            return out
+
+    def cancel(self) -> None:
+        self._finish("cancelled")
+
+    # ── listeners ────────────────────────────────────────────────────────
+
+    def _on_key(self, key) -> None:
+        if getattr(key, "name", None) == "esc":
+            self._finish("cancelled")
+            return
+        token = keymap.token_for_key(key)
+        if token:
+            self._finish("captured", token)
+            return
+        with self._lock:
+            if self._state.get("state") in ("waiting", "unsupported"):
+                self._state = {
+                    "state": "unsupported",
+                    "pressed": keymap.key_display_name(key),
+                }
+
+    def _on_click(self, x, y, button, pressed) -> None:
+        token = keymap.token_for_button(getattr(button, "name", ""))
+        if token is None:
+            return
+        now = time.time()
+        if pressed:
+            self._mouse_down = (token, now)
+            return
+        down = self._mouse_down
+        self._mouse_down = None
+        if down and down[0] == token and now - down[1] >= self.MOUSE_HOLD:
+            self._finish("captured", token)
+
+    def _on_fn(self, key, pressed: bool) -> None:
+        if pressed:
+            self._finish("captured", FN_KEY)
+
+    # ── teardown ─────────────────────────────────────────────────────────
+
+    def _finish(self, state: str, token: str | None = None) -> None:
+        with self._lock:
+            if self._state.get("state") not in ("waiting", "unsupported"):
+                return
+            self._teardown_locked()
+            if token:
+                info = keymap.label_for(token)
+                self._state = {
+                    "state": "captured",
+                    "token": token,
+                    "label": info,
+                    "risky": token in cfg.RISKY_KEYS,
+                }
+            else:
+                self._state = {"state": state}
+        print(f"Key capture: {self._state}")
+
+    def _teardown_locked(self) -> None:
+        self.engine.capture_hook = None
+        if self._timer:
+            self._timer.cancel()
+            self._timer = None
+        for listener in (self._keyboard, self._mouse):
+            if listener:
+                try:
+                    listener.stop()
+                except Exception:
+                    pass
+        self._keyboard = self._mouse = None
+        if self._fn:
+            fn, self._fn = self._fn, None
+            run_on_main(fn.stop)
+        self._mouse_down = None
+
+
+# ─── Process restart ─────────────────────────────────────────────────────────────
+
+
+def restart_process(delay: float = 0.3) -> None:
+    """Replace this process with a fresh copy of itself.
+
+    exec keeps the PID, so the supervisor in start.sh sees nothing and counts
+    no failure. Scheduled rather than immediate so an HTTP response asking for
+    the restart can still reach the browser.
+    """
+
+    def _go():
+        print("Restarting WhisperLocal...")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        try:
+            os.execv(sys.executable, list(sys.orig_argv))
+        except Exception as exc:  # pragma: no cover - exec failing is unusual
+            print(f"Error: restart failed: {exc}")
+            # 75 = EX_TEMPFAIL: the supervisor restarts on any non-zero exit.
+            os._exit(75)
+
+    timer = threading.Timer(delay, lambda: run_on_main(_go))
+    timer.daemon = True
+    timer.start()
+
+
 # ─── Menu bar app ────────────────────────────────────────────────────────────────
 
 
 class WhisperLocalApp(rumps.App):
     """The menu bar application."""
 
-    def __init__(self, engine: DictationEngine, settings: Settings):
+    def __init__(self, engine: DictationEngine, settings: Settings, web=None):
         super().__init__(cfg.APP_NAME, title=None, quit_button=None)
         self.engine = engine
         self.settings = settings
+        self.web = web  # WebServer, or None when the dashboard is off
+        self.on_quit = None  # extra shutdown work, set by run()
 
         # rumps seeds the status item from this attribute when the app launches
         # (NSApp.setStatusBarIcon reads _app['_icon_nsimage'], and _app is this
@@ -1543,13 +1642,31 @@ class WhisperLocalApp(rumps.App):
         self.status_item.set_callback(None)
         self.last_text_item = rumps.MenuItem("Last: (none)", callback=self._copy_last)
 
-        menu = [self.status_item, self.last_text_item]
-        if settings.history_enabled:
-            menu.append(rumps.MenuItem("Reveal History in Finder", callback=self._reveal_history))
-        menu += [
+        # Meetings. The recorder and detector are attached by run(); until
+        # then the items are hidden.
+        self.recorder: MeetingRecorder | None = None
+        self.detector: MeetingDetector | None = None
+        self.meeting_start_item = rumps.MenuItem("Start Meeting Recording", callback=self._start_meeting)
+        self.meeting_stop_item = rumps.MenuItem("Stop Meeting Recording", callback=self._stop_meeting)
+        self.meeting_stop_item.hidden = True
+        self._meeting_timer = rumps.Timer(self._tick_meeting, 1)
+        self._detected: DetectedMeeting | None = None
+
+        menu = [
+            self.status_item,
+            self.last_text_item,
+            None,
+            self.meeting_start_item,
+            self.meeting_stop_item,
+            rumps.MenuItem("Meetings…", callback=lambda _: self.open_web("meetings")),
+            None,
+            rumps.MenuItem("Dashboard…", callback=lambda _: self.open_web("dashboard")),
+            rumps.MenuItem("Settings…", callback=lambda _: self.open_web("settings")),
+            rumps.MenuItem("Reveal History in Finder", callback=self._reveal_history),
             None,
             self.toggle_item,
             rumps.MenuItem("Permissions…", callback=self._permissions),
+            rumps.MenuItem("Restart", callback=self._restart),
             None,
             rumps.MenuItem("Quit", callback=self._quit),
         ]
@@ -1577,6 +1694,22 @@ class WhisperLocalApp(rumps.App):
         statusitem.setTitle_("")
         statusitem.setImage_(image)
 
+    def apply_settings(self, settings: Settings) -> None:
+        """New settings: redraw the icon and the idle label."""
+        self.settings = settings
+        self._on_state_change(self.engine.state)
+
+    def open_web(self, fragment: str = "") -> None:
+        """Open the dashboard or settings page in the default browser."""
+        if self.web is None:
+            rumps.alert(
+                title="WhisperLocal — dashboard",
+                message="The dashboard is switched off (web_enabled = false in config.toml).",
+                ok="OK",
+            )
+            return
+        subprocess.Popen(["open", self.web.url(fragment)])
+
     def _on_state_change(self, state: str) -> None:
         """Reflect the engine state in the icon and the status line."""
         s = self.settings
@@ -1598,8 +1731,19 @@ class WhisperLocalApp(rumps.App):
         # below mutates an NSStatusItem, so all of it has to land on the main
         # thread or it trips the same AppKit assertion that killed the paste.
         def _apply():
-            self._set_menu_icon(icons.get(state, s.icon_idle))
-            self.status_item.title = labels.get(state, "Unknown")
+            meeting = self.recorder.status() if self.recorder else None
+            if state == DictationEngine.IDLE and meeting and meeting.get("recording"):
+                self._set_menu_icon(s.icon_meeting)
+                self.status_item.title = self._meeting_label(meeting)
+            elif state == DictationEngine.IDLE and self._detected is not None:
+                self._set_menu_icon(s.icon_meeting_detected)
+                self.status_item.title = f"Meeting detected in {self._detected.label} — record it?"
+            elif not self.engine.enabled and state == DictationEngine.IDLE:
+                self._set_menu_icon(s.icon_disabled)
+                self.status_item.title = "Disabled"
+            else:
+                self._set_menu_icon(icons.get(state, s.icon_idle))
+                self.status_item.title = labels.get(state, "Unknown")
 
             text = self.engine.last_transcription
             if text:
@@ -1612,15 +1756,8 @@ class WhisperLocalApp(rumps.App):
         """Turn dictation on or off without quitting."""
         self.engine.enabled = not self.engine.enabled
         sender.state = 1 if self.engine.enabled else 0
-
-        if self.engine.enabled:
-            self._set_menu_icon(self.settings.icon_idle)
-            self.status_item.title = f"Idle — hold {self.settings.trigger_label} to dictate"
-            print("Dictation enabled")
-        else:
-            self._set_menu_icon(self.settings.icon_disabled)
-            self.status_item.title = "Disabled"
-            print("Dictation disabled")
+        print("Dictation enabled" if self.engine.enabled else "Dictation disabled")
+        self._on_state_change(self.engine.state)
 
     def _permissions(self, sender) -> None:
         """Re-check permissions on demand, and say so when nothing is missing."""
@@ -1651,9 +1788,301 @@ class WhisperLocalApp(rumps.App):
         pyperclip.copy(text)
         rumps.notification(cfg.APP_NAME, "Copied to clipboard", text[:100])
 
+    # ── meetings ─────────────────────────────────────────────────────────
+
+    def attach_meetings(self, recorder: MeetingRecorder, detector: MeetingDetector | None) -> None:
+        self.recorder = recorder
+        self.detector = detector
+        recorder.on_event(self._on_meeting_event)
+
+    @staticmethod
+    def _meeting_label(status: dict) -> str:
+        secs = int(status.get("elapsed_s") or 0)
+        if secs >= 3600:
+            clock = f"{secs // 3600}:{secs % 3600 // 60:02d}:{secs % 60:02d}"
+        else:
+            clock = f"{secs // 60}:{secs % 60:02d}"
+        where = f" — {status['app']}" if status.get("app") else ""
+        return f"Recording meeting {clock}{where}"
+
+    def start_meeting(self, *, trigger: str = "manual", meeting: DetectedMeeting | None = None) -> None:
+        """Begin a meeting recording. Safe from any thread; errors go to an alert."""
+        if self.recorder is None:
+            return
+        app = meeting.label if meeting else None
+        bundle = meeting.bundle_id if meeting else None
+
+        def _go():
+            try:
+                self.recorder.start(trigger=trigger, app=app, app_bundle_id=bundle)
+            except Exception as exc:
+                print(f"Error: could not start the meeting recording: {exc}")
+                run_on_main(lambda: rumps.alert(
+                    title="WhisperLocal — meeting recording",
+                    message=f"Could not start recording:\n{exc}",
+                    ok="OK",
+                ))
+                return
+            if self.detector:
+                run_on_main(self.detector.notify_recording_started)
+            self._maybe_explain_system_audio()
+
+        threading.Thread(target=_go, daemon=True).start()
+
+    def stop_meeting(self) -> None:
+        if self.recorder is None:
+            return
+        threading.Thread(target=self.recorder.stop, daemon=True).start()
+        if self.detector:
+            self.detector.notify_recording_stopped()
+
+    def _start_meeting(self, sender) -> None:
+        self.start_meeting(trigger="manual", meeting=self._detected)
+
+    def _stop_meeting(self, sender) -> None:
+        self.stop_meeting()
+
+    def _maybe_explain_system_audio(self) -> None:
+        """First refusal of the system-audio tap: say where to grant it."""
+        from whisperlocal import systemaudio
+
+        denial = systemaudio.last_denial
+        if not denial or getattr(self, "_explained_audio", False):
+            return
+        self._explained_audio = True
+
+        def _ask():
+            choice = rumps.alert(
+                title="WhisperLocal — other participants' audio",
+                message=(
+                    "macOS did not allow WhisperLocal to capture system audio, so this "
+                    "meeting is being recorded from your microphone only.\n\n"
+                    "To include the other participants, allow WhisperLocal under "
+                    "System Settings → Privacy & Security → System Audio Recording Only, "
+                    "then start the next recording."
+                ),
+                ok="Open Settings",
+                cancel="Not now",
+            )
+            if choice == 1:
+                open_permission_pane("System Audio Recording")
+
+        run_on_main(_ask)
+
+    def _on_meeting_event(self, name: str, data: dict) -> None:
+        def _apply():
+            recording = bool(self.recorder and self.recorder.recording)
+            self.meeting_start_item.hidden = recording
+            self.meeting_stop_item.hidden = not recording
+            if name == "started":
+                self._meeting_timer.start()
+            elif name in ("stopped", "discarded", "failed"):
+                self._meeting_timer.stop()
+            elif name == "system_audio_unavailable":
+                self._maybe_explain_system_audio()
+            try:
+                if name == "finalized":
+                    words = data.get("words") or 0
+                    rumps.notification(cfg.APP_NAME, "Meeting transcript ready", f"{words:,} words saved")
+                elif name == "failed":
+                    rumps.notification(cfg.APP_NAME, "Meeting transcription failed", str(data.get("error") or ""))
+            except Exception as exc:
+                print(f"Warning: notification failed: {exc}")
+            self._on_state_change(self.engine.state)
+
+        run_on_main(_apply)
+
+    def _tick_meeting(self, _timer) -> None:
+        if self.engine.state == DictationEngine.IDLE:
+            self._on_state_change(self.engine.state)
+
+    # ── detection ────────────────────────────────────────────────────────
+
+    def on_meeting_detected(self, meeting: DetectedMeeting) -> None:
+        """Main thread, from the detector. Ask, or just start."""
+        self._detected = meeting
+        s = self.settings
+        if self.recorder and self.recorder.recording:
+            return
+        if s.meeting_auto_record:
+            self.start_meeting(trigger="auto", meeting=meeting)
+            return
+        if s.meeting_prompt == "notification":
+            self.sounds_ping()
+            try:
+                rumps.notification(
+                    cfg.APP_NAME,
+                    f"{meeting.label} call detected",
+                    "Record and transcribe this meeting?",
+                    data={"kind": "meeting"},
+                    action_button="Record",
+                    other_button="Not now",
+                )
+            except Exception as exc:
+                # Notification delivery is not guaranteed for a script-launched
+                # process; the dialog always works.
+                print(f"Warning: notification failed ({exc}) — asking with a dialog")
+                self._show_meeting_panel(meeting)
+                return
+            if self.detector:
+                self.detector.mark_prompted()
+        elif s.meeting_prompt == "panel":
+            self._show_meeting_panel(meeting)
+        else:
+            self.sounds_ping()
+        self._on_state_change(self.engine.state)
+
+    def sounds_ping(self) -> None:
+        try:
+            self.engine.sounds.play("Ping")
+        except Exception:
+            pass
+
+    def _show_meeting_panel(self, meeting: DetectedMeeting) -> None:
+        """A dialog ask, for when notifications are not delivered."""
+        choice = rumps.alert(
+            title=f"Record the {meeting.label} call?",
+            message="WhisperLocal can record and transcribe this meeting on your Mac.",
+            ok="Record",
+            cancel="Not now",
+        )
+        if choice == 1:
+            self.start_meeting(trigger="prompt", meeting=meeting)
+        elif self.detector:
+            self.detector.dismiss()
+
+    def on_meeting_ended(self, meeting: DetectedMeeting) -> None:
+        """Main thread, from the detector: the call is over, stop recording."""
+        self._detected = None
+        if self.recorder and self.recorder.recording:
+            self.stop_meeting()
+        self._on_state_change(self.engine.state)
+
+    def on_detector_state(self, state: str, meeting: DetectedMeeting | None) -> None:
+        if state in (MeetingDetector.NO_MEETING, MeetingDetector.RECORDING):
+            self._detected = None
+        self._on_state_change(self.engine.state)
+
+    def _restart(self, sender) -> None:
+        restart_process()
+
     def _quit(self, sender) -> None:
         print("WhisperLocal shutting down")
+        if self.recorder and self.recorder.recording:
+            self.status_item.title = "Finishing the meeting transcript…"
+            try:
+                self.recorder.shutdown()
+            except Exception as exc:
+                print(f"Warning: meeting shutdown failed: {exc}")
+        if self.on_quit:
+            try:
+                self.on_quit()
+            except Exception as exc:
+                print(f"Warning: shutdown step failed: {exc}")
+        if self.web:
+            self.web.stop()
         rumps.quit_application()
+
+
+@rumps.notifications
+def _on_notification(info) -> None:
+    """Clicks on our notifications. Only the meeting prompt carries data."""
+    try:
+        data = info.data if hasattr(info, "data") else dict(info)
+    except Exception:
+        data = {}
+    if not isinstance(data, dict) or data.get("kind") != "meeting":
+        return
+    app = getattr(rumps.App, "*app_instance", None)
+    if app is None:
+        return
+    activation = getattr(info, "activation_type", None)
+    if activation in ("action_button_clicked", "contents_clicked", None):
+        app.start_meeting(trigger="prompt", meeting=app._detected)
+    elif app.detector:
+        app.detector.dismiss()
+
+
+# ─── What the web layer sees ─────────────────────────────────────────────────────
+
+
+class RunningAppContext:
+    """The live app, as the HTTP handlers see it. See web/api.py AppContext.
+
+    HTTP handlers run on their own threads; nothing here may touch AppKit
+    directly. Plain attribute reads on the engine are fine.
+    """
+
+    running = True
+
+    def __init__(
+        self,
+        *,
+        settings: SettingsManager,
+        engine: DictationEngine,
+        listeners: TriggerListeners,
+        transcriber: Transcriber,
+        capture: KeyCapture,
+    ):
+        from whisperlocal import __version__, keychain
+
+        self.settings = settings
+        self.engine = engine
+        self.listeners = listeners
+        self.transcriber = transcriber
+        self.capture = capture
+        self.version = __version__
+        self.meetings = None  # MeetingStore, set once meetings are wired up
+        self.recorder = None  # MeetingRecorder
+        self.detector = None  # MeetingDetector
+        self._keychain = keychain
+        self._started = time.time()
+
+    @property
+    def history_path(self):
+        return self.settings.current.history_path
+
+    def status(self) -> dict:
+        engine = self.engine
+        s = self.settings.current
+        text = engine.last_transcription
+        out = {
+            "running": True,
+            "state": engine.state,
+            "enabled": engine.enabled,
+            "last_transcription": (text[:120] + "…") if len(text) > 120 else text,
+            "model": s.model_path,
+            "model_loaded": self.transcriber._loaded,
+            "memory": self.transcriber.memory_report(),
+            "listeners": self.listeners.describe(),
+            "trigger_label": s.trigger_label,
+            "backend": engine.backend.name,
+            "uptime_s": round(time.time() - self._started),
+            "capture": self.capture.state(),
+            "meeting": self.recorder.status() if self.recorder else None,
+        }
+        return out
+
+    def start_capture(self) -> dict:
+        return self.capture.start()
+
+    def capture_state(self) -> dict:
+        return self.capture.state()
+
+    def cancel_capture(self) -> None:
+        self.capture.cancel()
+
+    def request_restart(self) -> None:
+        restart_process()
+
+    def api_key_set(self) -> bool:
+        return self._keychain.has_api_key()
+
+    def set_api_key(self, key: str) -> None:
+        self._keychain.set_api_key(key)
+
+    def clear_api_key(self) -> None:
+        self._keychain.clear_api_key()
 
 
 # ─── Permissions ─────────────────────────────────────────────────────────────────
@@ -1663,6 +2092,7 @@ PERMISSION_PANES = {
     "Accessibility": f"{PANE}?Privacy_Accessibility",
     "Input Monitoring": f"{PANE}?Privacy_ListenEvent",
     "Microphone": f"{PANE}?Privacy_Microphone",
+    "System Audio Recording": f"{PANE}?Privacy_AudioCapture",
 }
 
 
@@ -1781,22 +2211,8 @@ def run(settings: Settings) -> int:
     print(f"  Config:    {cfg.config_path()}")
     print()
 
-    if cfg.MOUSE_LEFT in settings.trigger_keys:
-        guard = settings.mouse_drag_cancel_px
-        print("  Note: the left mouse button is also what every drag, text")
-        print("        selection and window move holds down.")
-        if guard:
-            print(f"        Presses that travel more than {guard}px are treated as")
-            print("        drags and cancelled before recording starts.")
-        else:
-            print("        The drag guard is OFF (mouse_drag_cancel_px = 0), so any")
-            print("        press held long enough will record. Consider mouse_right.")
-        print()
-
-    risky = [k for k in settings.trigger_keys if k in cfg.RISKY_KEYS and k != cfg.MOUSE_LEFT]
-    if risky:
-        print(f"  Note: {', '.join(risky)} is used by other things on macOS.")
-        print("        Holding it during one will start a recording.")
+    for note in cfg.trigger_warnings(settings):
+        print(f"  Note: {note}")
         print()
 
     print("  Not working? Run: whisperlocal doctor")
@@ -1809,56 +2225,78 @@ def run(settings: Settings) -> int:
 
     # Start the listeners. Fn and ordinary keys use different mechanisms and
     # both can run at once, so a config mixing them gets two live listeners.
-    started_any = False
-
-    if settings.uses_fn:
-        # The tap goes on the main runloop, so this must happen before
-        # app.run() starts it.
-        fn_listener = FnKeyListener(engine.on_key_press, engine.on_key_release)
-        if fn_listener.start():
-            print("Fn listener started")
-            started_any = True
-        else:
-            print("Error: could not start the Fn listener")
-
-    if settings.pynput_keys:
-        listener = Listener(on_press=engine.on_key_press, on_release=engine.on_key_release)
-        listener.daemon = True
-        listener.start()
-        print(f"Key listener started ({', '.join(settings.pynput_keys)})")
-        started_any = True
-
-    if settings.mouse_buttons:
-        mouse_listener = MouseTriggerListener(
-            settings,
-            on_press=engine.on_key_press,
-            on_release=engine.on_key_release,
-            on_cancel=engine.cancel_trigger,
-        )
-        if mouse_listener.start():
-            print(
-                f"Mouse listener started ({', '.join(settings.mouse_buttons)}, "
-                f"hold {settings.mouse_hold_threshold}s)"
-            )
-            started_any = True
-
-    if not started_any:
-        print("Error: no trigger listener could start — dictation will not fire.")
-        print("   Grant Input Monitoring to your terminal, then try again.")
+    # The Fn tap goes on the main runloop, so this must happen before
+    # app.run() starts it.
+    listeners = TriggerListeners(engine)
+    listeners.start(settings)
 
     def _prewarm():
         """Load the model now so the first dictation is not the slow one."""
         print("Pre-warming the model (the first run downloads weights)...")
-        transcriber._ensure_loaded()
+        transcriber.warm()
         print("Model ready")
         sounds.done()
 
     threading.Thread(target=_prewarm, daemon=True).start()
 
+    # Settings can change while running: the Settings page writes config.toml
+    # and pushes the new values through here.
+    settings_mgr = SettingsManager(settings)
+    capture = KeyCapture(engine, listeners)
+
+    web = None
+    if settings.web_enabled:
+        from whisperlocal.web.server import WebConfig, WebServer
+
+        ctx = RunningAppContext(
+            settings=settings_mgr,
+            engine=engine,
+            listeners=listeners,
+            transcriber=transcriber,
+            capture=capture,
+        )
+        web = WebServer(ctx, WebConfig(port=settings.web_port))
+        try:
+            url = web.start()
+            print(f"Dashboard: {url.split('?')[0]}")
+        except Exception as exc:
+            print(f"Warning: dashboard not started: {exc}")
+            web = None
+
     print("Menu bar app starting...")
     print()
 
-    app = WhisperLocalApp(engine, settings)
+    app = WhisperLocalApp(engine, settings, web=web)
+
+    # Meetings: the store and recorder always exist (the menu items and the
+    # CLI use them); detection only runs when meeting_enabled.
+    store = MeetingStore(settings.meeting_root)
+    recorder = MeetingRecorder(settings, store, transcriber, engine=engine, sounds=sounds)
+    detector = MeetingDetector(
+        settings,
+        on_detected=app.on_meeting_detected,
+        on_ended=app.on_meeting_ended,
+        on_state=app.on_detector_state,
+    )
+    app.attach_meetings(recorder, detector)
+    if web is not None:
+        ctx.meetings = store
+        ctx.recorder = recorder
+        ctx.detector = detector
+    if settings.meeting_enabled:
+        detector.start()
+
+    def _on_settings_changed(old: Settings, new: Settings, tiers: dict) -> None:
+        engine.apply_settings(new)
+        app.apply_settings(new)
+        recorder.apply_settings(new)
+        run_on_main(lambda: detector.apply_settings(new))
+        if tiers.get(Tier.LISTENERS):
+            run_on_main(lambda: listeners.restart(new))
+        if tiers.get(Tier.RESTART):
+            print(f"Settings changed that need a restart: {', '.join(tiers[Tier.RESTART])}")
+
+    settings_mgr.subscribe(_on_settings_changed)
 
     # Ask for anything macOS will not prompt for on its own, once the menu bar
     # exists so the alert has an app to belong to.

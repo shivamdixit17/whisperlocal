@@ -21,11 +21,17 @@ import json
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from whisperlocal.analytics import entry_time
 from whisperlocal.config import Settings
 
 
-def load(path: Path, days: int | None = None) -> list[dict]:
-    """Read the log, skipping any malformed line rather than dying on it."""
+def load_entries(path: Path, days: int | None = None) -> tuple[list[dict], int]:
+    """Read the log, skipping any malformed line rather than dying on it.
+
+    Returns (entries, skipped_count). `days` is a rolling cutoff: entries
+    older than now - days are dropped. Entries are returned as parsed, not
+    mutated; use analytics.entry_time() to get a datetime out of one.
+    """
     entries: list[dict] = []
     skipped = 0
 
@@ -40,16 +46,31 @@ def load(path: Path, days: int | None = None) -> list[dict]:
                 continue
             try:
                 entry = json.loads(line)
-                if cutoff:
-                    ts = datetime.datetime.fromisoformat(entry["timestamp"])
-                    if ts < cutoff:
-                        continue
-                entries.append(entry)
             except Exception:
                 # A partial trailing line is the expected cost of append-only
                 # writes if the app died mid-write. Never fatal.
                 skipped += 1
+                continue
+            if not isinstance(entry, dict):
+                skipped += 1
+                continue
+            if cutoff is not None:
+                ts = entry_time(entry)
+                if ts is None:
+                    skipped += 1
+                    continue
+                if ts.tzinfo is None:
+                    ts = ts.astimezone()
+                if ts < cutoff:
+                    continue
+            entries.append(entry)
 
+    return entries, skipped
+
+
+def load(path: Path, days: int | None = None) -> list[dict]:
+    """load_entries() for the CLI: prints the skipped-line note, returns entries."""
+    entries, skipped = load_entries(path, days)
     if skipped:
         print(f"(skipped {skipped} unreadable line(s))\n")
     return entries

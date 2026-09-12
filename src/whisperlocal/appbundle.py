@@ -48,6 +48,58 @@ BUNDLE_ID = "com.shivamdixit.whisperlocal"
 # Any change to these two strings changes the cdhash and revokes every existing
 # user's Accessibility and Input Monitoring grants. Treat them as frozen.
 
+# Generation 1 (releases before 1.3): kept byte-for-byte so an installed
+# bundle can be recognised as the old one and the upgrade explained.
+INFO_PLIST_V1 = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>
+  <string>WhisperLocal</string>
+
+  <key>CFBundleDisplayName</key>
+  <string>WhisperLocal</string>
+
+  <!-- TCC identity. Never change this: the Accessibility / Input Monitoring /
+       Microphone grants are keyed to it. -->
+  <key>CFBundleIdentifier</key>
+  <string>com.shivamdixit.whisperlocal</string>
+
+  <key>CFBundleExecutable</key>
+  <string>WhisperLocal</string>
+
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+
+  <key>CFBundleShortVersionString</key>
+  <string>1.0</string>
+
+  <key>CFBundleVersion</key>
+  <string>1</string>
+
+  <!-- Menu-bar-only app: no Dock icon, no app switcher entry. -->
+  <key>LSUIElement</key>
+  <true/>
+
+  <key>LSMinimumSystemVersion</key>
+  <string>13.0</string>
+
+  <key>NSMicrophoneUsageDescription</key>
+  <string>WhisperLocal records your voice while you hold the push-to-talk key so it can transcribe it locally on this Mac.</string>
+
+  <key>NSHighResolutionCapable</key>
+  <true/>
+</dict>
+</plist>
+"""
+
+# Generation 2 (1.3+): adds the system-audio usage string for meeting
+# recording. This is the one deliberate re-seal; see bundle_generation().
 INFO_PLIST = """\
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -89,6 +141,8 @@ INFO_PLIST = """\
 
   <key>NSMicrophoneUsageDescription</key>
   <string>WhisperLocal records your voice while you hold the push-to-talk key so it can transcribe it locally on this Mac.</string>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>WhisperLocal captures the other participants' audio only while a meeting recording is running, and transcribes it on this Mac unless you opt into a cloud backend.</string>
 
   <key>NSHighResolutionCapable</key>
   <true/>
@@ -280,6 +334,46 @@ def bundle_is_current() -> bool:
         except (OSError, UnicodeDecodeError):
             return False
     return True
+
+
+def bundle_generation() -> int | None:
+    """Which release family sealed the installed bundle.
+
+    1 = pre-1.3 (no system-audio usage string), 2 = current, None = missing
+    or hand-edited. Used by install() to explain the one-time permission
+    re-grant that the 1.3 re-seal costs.
+    """
+    plist = bundle_path() / "Contents" / "Info.plist"
+    launcher = bundle_path() / "Contents" / "MacOS" / APP_NAME
+    try:
+        plist_text = plist.read_text(encoding="utf-8")
+        launcher_text = launcher.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    if launcher_text != LAUNCHER:
+        return None
+    if plist_text == INFO_PLIST:
+        return 2
+    if plist_text == INFO_PLIST_V1:
+        return 1
+    return None
+
+
+def reset_tcc_grants() -> None:
+    """Drop the stale Accessibility / Input Monitoring rows for our bundle id.
+
+    After a re-sign macOS keeps the old toggles switched on in System Settings
+    while quietly ignoring them, which is far more confusing than a fresh
+    prompt. tccutil only clears; it never grants.
+    """
+    for service in ("Accessibility", "ListenEvent"):
+        try:
+            subprocess.run(
+                ["tccutil", "reset", service, BUNDLE_ID],
+                capture_output=True, text=True, timeout=20, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
 
 
 def bundle_cdhash() -> str | None:
@@ -474,6 +568,12 @@ def install(force: bool = False, start: bool = True) -> int:
         return 1
 
     before = bundle_cdhash()
+    generation = bundle_generation()
+
+    if generation == 1 and not force:
+        print("This upgrade adds meeting recording, which needs one new line in the")
+        print("app bundle (permission to capture other participants' audio).")
+        print()
 
     if write_bundle(force=force):
         action = "Rebuilt" if before else "Created"
@@ -484,11 +584,16 @@ def install(force: bool = False, start: bool = True) -> int:
 
     after = bundle_cdhash()
     if before and after and before != after:
+        reset_tcc_grants()
         print()
         print("Note: the bundle signature changed, so macOS has forgotten its")
         print("      Accessibility and Input Monitoring grants. Re-grant them:")
         print("      whisperlocal doctor")
         print()
+    elif generation == 1 and after:
+        # Observed on macOS 26: the ad-hoc seal of a script-launched bundle
+        # does not cover Info.plist, so the cdhash — and the grants — survive.
+        print("   The signature is unchanged; your granted permissions survive.")
 
     write_supervisor()
     print(f"Wrote {supervisor_path()}")

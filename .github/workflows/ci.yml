@@ -28,6 +28,11 @@ jobs:
       - name: Byte-compile all sources
         run: uv run --no-project python -m compileall -q src/
 
+      # The pure modules — config, analytics, the TOML writer, the web router —
+      # are testable anywhere. Only the parts that need AppKit or audio are not.
+      - name: Run the tests
+        run: uv run --no-project --with pytest python -m pytest -q tests/
+
       - name: Check the installer scripts
         run: |
           bash -n install.sh

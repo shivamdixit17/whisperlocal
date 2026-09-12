@@ -93,8 +93,57 @@ MODEL_ALIASES: dict[str, str] = {
     "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
 }
 
+# ─── Backends and meetings ───────────────────────────────────────────────────────
+BACKENDS: tuple[str, ...] = ("local", "api")
+MEETING_PROMPTS: tuple[str, ...] = ("notification", "panel", "none")
+
+# Keys accepted in `meeting_apps`. The bundle ids behind each live in
+# meetingdetect.py; this is the user-facing vocabulary.
+MEETING_APP_KEYS: tuple[str, ...] = (
+    "zoom", "teams", "facetime", "slack", "webex", "discord", "browser",
+)
+
 # ─── UI ──────────────────────────────────────────────────────────────────────────
 APP_NAME = "WhisperLocal"
+
+# The icon colour every config written before 1.3 pinned, because the template
+# copied the then-default into the file. It is treated as "unset" so those users
+# get the monochrome icon without editing anything.
+LEGACY_ICON_COLOR = (1.00, 0.58, 0.00)
+LEGACY_ICONS: dict[str, str] = {
+    "icon_idle": "mic",
+    "icon_waiting": "hourglass",
+    "icon_recording": "mic.fill",
+    "icon_transcribing": "waveform",
+    "icon_disabled": "mic.slash",
+    "icon_point_size": "15",
+}
+
+
+def is_legacy_icon_color(value: object) -> bool:
+    try:
+        seq = tuple(float(v) for v in value)  # type: ignore[union-attr]
+    except (TypeError, ValueError):
+        return False
+    return len(seq) == 3 and all(abs(a - b) < 1e-6 for a, b in zip(seq, LEGACY_ICON_COLOR))
+
+
+def legacy_icon_keys(values: dict[str, object]) -> list[str]:
+    """Which icon settings in `values` are the pre-1.3 template defaults.
+
+    The colour is judged on its own. The glyph names only count as legacy when
+    the whole set matches — someone who picked "mic" on purpose would not have
+    "hourglass" and the rest alongside it by coincidence.
+    """
+    out: list[str] = []
+    if is_legacy_icon_color(values.get("icon_color")):
+        out.append("icon_color")
+    names = [k for k in LEGACY_ICONS if k in values]
+    if len(names) == len(LEGACY_ICONS) and all(
+        str(values[k]) == LEGACY_ICONS[k] for k in names
+    ):
+        out.extend(names)
+    return out
 
 
 @dataclass(frozen=True)
@@ -191,6 +240,48 @@ class Settings:
     max_repeat_ratio: float = 0.30
     repeat_min_words: int = 5
 
+    # ── Transcription backend ────────────────────────────────────────────────
+    # "local" runs the MLX model on this Mac. "api" sends the audio to an
+    # OpenAI-compatible transcription endpoint (OpenAI, Groq, a self-hosted
+    # server) — explicit opt-in, because it is the one thing here that puts
+    # audio on the network. The key lives in the macOS Keychain, never in this
+    # file: `whisperlocal api-key set`.
+    dictation_backend: str = "local"
+    meeting_backend: str = "local"
+    api_base_url: str = "https://api.openai.com/v1"
+    api_model: str = "whisper-1"
+    api_timeout_seconds: int = 120
+
+    # ── Meetings ─────────────────────────────────────────────────────────────
+    # When a meeting app has the microphone open, offer to record the call:
+    # your mic plus the other participants through a system-audio tap, both
+    # transcribed and saved under meeting_dir.
+    meeting_enabled: bool = True
+    meeting_auto_record: bool = False
+    meeting_prompt: str = "notification"  # "notification" | "panel" | "none"
+    meeting_apps: tuple[str, ...] = (
+        "zoom", "teams", "facetime", "slack", "webex", "discord", "browser",
+    )
+    meeting_system_audio: bool = True
+    meeting_system_device: str = ""  # a BlackHole-style input, if no tap is possible
+    meeting_tap_scope: str = "system"  # "system" | "app"
+    meeting_transcribe_live: bool = True
+    meeting_model: str = ""  # empty: same as `model`
+    meeting_segment_seconds: int = 60
+    meeting_silence_db: float = -45.0
+    meeting_end_grace_seconds: int = 20
+    meeting_min_seconds: int = 60
+    meeting_keep_audio: bool = True
+    meeting_audio_format: str = "flac"  # "flac" | "wav"
+    meeting_transcript_words: bool = False
+    meeting_dir: str = "~/Library/Application Support/WhisperLocal/meetings"
+
+    # ── Dashboard ────────────────────────────────────────────────────────────
+    # The Settings page and the analytics dashboard are served to your browser
+    # from this machine only (127.0.0.1). Nothing is reachable from outside.
+    web_enabled: bool = True
+    web_port: int = 47311
+
     # ── Dictation history ────────────────────────────────────────────────────
     # Every dictation is appended to a JSONL file, one object per line:
     # append-only, so a crash costs at most a partial trailing line, and it
@@ -210,18 +301,23 @@ class Settings:
 
     # ── Menu bar icons ───────────────────────────────────────────────────────
     # SF Symbol names (macOS 11+). Any name from Apple's SF Symbols app works.
-    icon_idle: str = "mic"
-    icon_waiting: str = "hourglass"
-    icon_recording: str = "mic.fill"
-    icon_transcribing: str = "waveform"
-    icon_disabled: str = "mic.slash"
-    icon_point_size: int = 15
+    # The waveform family rather than "mic": macOS Dictation already uses the
+    # microphone glyph, and in monochrome the filled circle is unmistakably
+    # "live" next to the outline.
+    icon_idle: str = "waveform"
+    icon_waiting: str = "waveform.circle"
+    icon_recording: str = "waveform.circle.fill"
+    icon_transcribing: str = "ellipsis.circle"
+    icon_disabled: str = "waveform.slash"
+    icon_meeting: str = "record.circle"
+    icon_meeting_detected: str = "person.2.wave.2"
+    icon_point_size: int = 16
 
     # Menu bar glyph colour as (r, g, b) in 0-1, or empty for a template image.
-    # A template renders monochrome and follows the menu bar automatically in
-    # light and dark mode; a fixed colour does not, so this orange is one that
-    # reads on both.
-    icon_color: tuple[float, ...] = (1.00, 0.58, 0.00)
+    # Empty is right for almost everyone: a template renders monochrome, exactly
+    # like the system's own status icons, and follows light and dark mode on its
+    # own. A fixed colour does neither.
+    icon_color: tuple[float, ...] = ()
 
     # ── Derived ──────────────────────────────────────────────────────────────
 
@@ -271,6 +367,20 @@ class Settings:
         return Path(self.history_file).expanduser()
 
     @property
+    def meeting_model_path(self) -> str:
+        """Model used for meetings: `meeting_model` if set, else `model`."""
+        name = self.meeting_model or self.model
+        return MODEL_ALIASES.get(name, name)
+
+    @property
+    def meeting_root(self) -> Path:
+        return Path(self.meeting_dir).expanduser()
+
+    @property
+    def uses_api(self) -> bool:
+        return "api" in (self.dictation_backend, self.meeting_backend)
+
+    @property
     def icon_rgb(self) -> tuple[float, float, float] | None:
         """Icon colour as a 3-tuple, or None for a template image."""
         if not self.icon_color or len(self.icon_color) != 3:
@@ -304,6 +414,9 @@ def temp_audio_file() -> Path:
 # ─── Loading ─────────────────────────────────────────────────────────────────────
 
 ENV_PREFIX = "WHISPERLOCAL_"
+
+# Tuple-valued settings whose elements are numbers rather than names.
+FLOAT_TUPLE_FIELDS: frozenset[str] = frozenset({"icon_color"})
 
 
 class ConfigError(ValueError):
@@ -339,9 +452,13 @@ def _coerce(name: str, raw: object, default: object) -> object:
         return _as_bool(name, raw)
 
     if isinstance(default, tuple):
+        # An empty value is legitimate for icon_color ("follow the menu bar").
+        if isinstance(raw, (list, tuple)) and not raw:
+            return ()
         seq = _as_seq(name, raw)
-        # icon_color is numeric; trigger_keys is strings.
-        if default and isinstance(default[0], float):
+        # icon_color is numeric; the other tuples are strings. The default
+        # cannot tell us (it is empty), so the field name does.
+        if name in FLOAT_TUPLE_FIELDS:
             try:
                 return tuple(float(v) for v in seq)
             except (TypeError, ValueError):
@@ -428,6 +545,66 @@ def validate(settings: Settings) -> None:
     if settings.icon_color and len(settings.icon_color) not in (0, 3):
         raise ConfigError("icon_color: expected three numbers (r, g, b) or an empty list")
 
+    for name in ("dictation_backend", "meeting_backend"):
+        if getattr(settings, name) not in BACKENDS:
+            raise ConfigError(f"{name}: choose one of {', '.join(BACKENDS)}")
+    if not settings.api_base_url.startswith(("http://", "https://")):
+        raise ConfigError("api_base_url: must start with http:// or https://")
+    if settings.api_timeout_seconds <= 0:
+        raise ConfigError("api_timeout_seconds: must be greater than zero")
+
+    if settings.meeting_prompt not in MEETING_PROMPTS:
+        raise ConfigError(f"meeting_prompt: choose one of {', '.join(MEETING_PROMPTS)}")
+    unknown_apps = [a for a in settings.meeting_apps if a not in MEETING_APP_KEYS]
+    if unknown_apps:
+        raise ConfigError(
+            f"meeting_apps: {', '.join(repr(a) for a in unknown_apps)} not known. "
+            f"Choose from: {', '.join(MEETING_APP_KEYS)}"
+        )
+    if settings.meeting_tap_scope not in ("system", "app"):
+        raise ConfigError("meeting_tap_scope: choose 'system' or 'app'")
+    if settings.meeting_audio_format not in ("flac", "wav"):
+        raise ConfigError("meeting_audio_format: choose 'flac' or 'wav'")
+    if not 20 <= settings.meeting_segment_seconds <= 300:
+        raise ConfigError("meeting_segment_seconds: must be between 20 and 300")
+    if settings.meeting_end_grace_seconds < 0:
+        raise ConfigError("meeting_end_grace_seconds: must be zero or more")
+    if settings.meeting_min_seconds < 0:
+        raise ConfigError("meeting_min_seconds: must be zero or more")
+    if "/" not in settings.meeting_model_path:
+        raise ConfigError(
+            f"meeting_model: {settings.meeting_model!r} is not a known name or a "
+            f"Hugging Face repo id. Known names: {', '.join(MODEL_ALIASES)}"
+        )
+
+    if not 1024 <= settings.web_port <= 65535:
+        raise ConfigError("web_port: must be between 1024 and 65535")
+
+
+def trigger_warnings(settings: Settings) -> list[str]:
+    """Things worth saying about the chosen triggers. Printed at startup and
+    shown by the Settings page after a save."""
+    out: list[str] = []
+    if MOUSE_LEFT in settings.trigger_keys:
+        guard = settings.mouse_drag_cancel_px
+        note = (
+            "The left mouse button is also what every drag, text selection and "
+            "window move holds down. "
+        )
+        if guard:
+            note += f"Presses that travel more than {guard}px are treated as drags and cancelled."
+        else:
+            note += (
+                "The drag guard is OFF (mouse_drag_cancel_px = 0), so any press held "
+                "long enough will record. Consider mouse_right."
+            )
+        out.append(note)
+    risky = [k for k in settings.trigger_keys if k in RISKY_KEYS and k != MOUSE_LEFT]
+    if risky:
+        names = ", ".join(KEY_LABELS.get(k, k) for k in risky)
+        out.append(f"{names} is used by other things on macOS; holding it during one starts a recording.")
+    return out
+
 
 def _read_toml(path: Path) -> dict[str, object]:
     """Read the config file, tolerating its absence."""
@@ -444,6 +621,46 @@ def _read_toml(path: Path) -> dict[str, object]:
         return {}
 
 
+def _resolve(*, quiet: bool = False) -> tuple[dict[str, object], dict[str, str]]:
+    """Raw values from the file and the environment, plus where each came from."""
+    known = {f.name for f in fields(Settings)}
+    resolved: dict[str, object] = {}
+    sources: dict[str, str] = {}
+
+    for key, value in _read_toml(config_path()).items():
+        if key == "trigger_key":
+            # Accepted for compatibility with the single-key setting this
+            # replaced, so an older config keeps working untouched.
+            resolved["trigger_keys"] = value
+            sources["trigger_keys"] = "file"
+            continue
+        if key not in known:
+            if not quiet:
+                print(f"Warning: unknown setting {key!r} in config.toml — ignored", file=sys.stderr)
+            continue
+        resolved[key] = value
+        sources[key] = "file"
+
+    for name in known:
+        env_value = os.environ.get(ENV_PREFIX + name.upper())
+        if env_value is not None:
+            resolved[name] = env_value
+            sources[name] = "env"
+    legacy_env = os.environ.get(ENV_PREFIX + "TRIGGER_KEY")
+    if legacy_env is not None:
+        resolved["trigger_keys"] = legacy_env
+        sources["trigger_keys"] = "env"
+
+    return resolved, sources
+
+
+def sources() -> dict[str, str]:
+    """For every setting: "default", "file" or "env". The Settings page uses this
+    to show which values it cannot change (environment overrides win)."""
+    _, found = _resolve(quiet=True)
+    return {f.name: found.get(f.name, "default") for f in fields(Settings)}
+
+
 def load(*, strict: bool = False) -> Settings:
     """
     Resolve settings from defaults, the config file, then the environment.
@@ -453,27 +670,7 @@ def load(*, strict: bool = False) -> Settings:
     `whisperlocal config --show` uses.
     """
     defaults = Settings()
-    known = {f.name for f in fields(Settings)}
-    resolved: dict[str, object] = {}
-
-    for key, value in _read_toml(config_path()).items():
-        if key == "trigger_key":
-            # Accepted for compatibility with the single-key setting this
-            # replaced, so an older config keeps working untouched.
-            resolved["trigger_keys"] = value
-            continue
-        if key not in known:
-            print(f"Warning: unknown setting {key!r} in config.toml — ignored", file=sys.stderr)
-            continue
-        resolved[key] = value
-
-    for name in known:
-        env_value = os.environ.get(ENV_PREFIX + name.upper())
-        if env_value is not None:
-            resolved[name] = env_value
-    legacy_env = os.environ.get(ENV_PREFIX + "TRIGGER_KEY")
-    if legacy_env is not None:
-        resolved["trigger_keys"] = legacy_env
+    resolved, _ = _resolve()
 
     typed: dict[str, object] = {}
     for name, value in resolved.items():
@@ -483,6 +680,21 @@ def load(*, strict: bool = False) -> Settings:
             if strict:
                 raise
             print(f"Warning: {exc} — using the default", file=sys.stderr)
+
+    legacy = legacy_icon_keys(typed)
+    if legacy:
+        # Written by `config --init` before 1.3, not chosen: the template copied
+        # the then-defaults into the file. Drop them so the icon follows the
+        # menu bar like every other status icon.
+        for name in legacy:
+            del typed[name]
+        if not strict:
+            print(
+                f"Note: {', '.join(legacy)} in config.toml hold the pre-1.3 defaults; "
+                "the icon now follows the menu bar. Delete those lines (or choose "
+                "your own) to silence this.",
+                file=sys.stderr,
+            )
 
     settings = Settings(**typed)  # type: ignore[arg-type]
 
@@ -610,6 +822,82 @@ overlay_anchor = "caret"
 overlay_offset_x = 14
 overlay_offset_y = 0
 
+# ─── Cloud transcription (opt-in) ───────────────────────────────────────────
+# "local" runs the MLX model on this Mac and never touches the network.
+# "api" sends the audio to an OpenAI-compatible transcription endpoint —
+# OpenAI, Groq, or a server of your own — and is the ONE thing here that puts
+# your audio on the network. Choose it per use: quick dictation can stay
+# local while long meetings go to a bigger model, or the other way round.
+dictation_backend = "local"
+meeting_backend = "local"
+
+# Where "api" sends audio. The key is NOT stored here: it lives in the macOS
+# Keychain. Store it with:  whisperlocal api-key set
+api_base_url = "https://api.openai.com/v1"
+api_model = "whisper-1"
+api_timeout_seconds = 120
+
+# ─── Meetings ───────────────────────────────────────────────────────────────
+# When a meeting app has the microphone open, WhisperLocal can record the call
+# — your microphone plus the other participants through a system-audio tap —
+# and transcribe it. Meetings are saved under meeting_dir with a transcript
+# you can search and export from the Meetings page.
+meeting_enabled = true
+
+# Start recording without asking whenever a meeting is detected, and stop
+# when it ends. Off: you get a notification with a Record button instead.
+meeting_auto_record = false
+
+# How to ask: "notification" (a banner with a Record button), "panel" (a
+# dialog), or "none" (only the menu bar icon changes).
+meeting_prompt = "notification"
+
+# Which apps count as a meeting. "browser" covers Google Meet and friends.
+meeting_apps = ["zoom", "teams", "facetime", "slack", "webex", "discord", "browser"]
+
+# Capture the other participants through a system-audio tap (macOS 14.2+).
+# The first recording asks for "System Audio Recording Only" permission. Off,
+# or when the permission is refused, only your microphone is recorded.
+meeting_system_audio = true
+
+# If taps are not possible on your Mac, name a virtual input device here
+# (BlackHole, for example) that carries the system audio instead.
+meeting_system_device = ""
+
+# Transcribe while the meeting is still running, a minute at a time, so the
+# transcript is ready moments after you hang up. Off: everything is
+# transcribed after the meeting ends — easier on a fanless Mac.
+meeting_transcribe_live = true
+
+# A different model for meetings; empty means the same as `model`. Meetings
+# are where a bigger model pays off.
+meeting_model = ""
+
+# Audio is cut into segments of roughly this many seconds at a quiet moment.
+meeting_segment_seconds = 60
+meeting_silence_db = -45.0
+
+# Seconds without the meeting app using the microphone before the call
+# counts as over, and the shortest detected call worth keeping.
+meeting_end_grace_seconds = 20
+meeting_min_seconds = 60
+
+# Keep the audio next to the transcript ("flac" or "wav"), or delete it once
+# the transcript is written.
+meeting_keep_audio = true
+meeting_audio_format = "flac"
+
+# Also keep word-level timestamps (larger files).
+meeting_transcript_words = false
+
+meeting_dir = "~/Library/Application Support/WhisperLocal/meetings"
+
+# ─── Dashboard ──────────────────────────────────────────────────────────────
+# The Settings page and the analytics dashboard, served to your own browser
+# from 127.0.0.1 only. Open them from the menu bar.
+web_enabled = true
+web_port = 47311
+
 # ─── Dictation history ──────────────────────────────────────────────────────
 # Every dictation, successful or not, is appended to a JSONL file. This is what
 # `whisperlocal stats` reads. Failures are logged too — the hallucination rate
@@ -642,14 +930,17 @@ repeat_min_words = 5
 
 # ─── Menu bar ───────────────────────────────────────────────────────────────
 # SF Symbol names — any name from Apple's SF Symbols app works.
-icon_idle = "mic"
-icon_waiting = "hourglass"
-icon_recording = "mic.fill"
-icon_transcribing = "waveform"
-icon_disabled = "mic.slash"
-icon_point_size = 15
+icon_idle = "waveform"
+icon_waiting = "waveform.circle"
+icon_recording = "waveform.circle.fill"
+icon_transcribing = "ellipsis.circle"
+icon_disabled = "waveform.slash"
+icon_meeting = "record.circle"
+icon_meeting_detected = "person.2.wave.2"
+icon_point_size = 16
 
-# Glyph colour as (r, g, b) from 0 to 1. Use an empty list [] for a template
-# image, which renders monochrome and follows light/dark mode automatically.
-icon_color = [1.00, 0.58, 0.00]
+# Glyph colour. Leave empty for a template image, which renders monochrome like
+# the system's own status icons and follows light/dark mode automatically.
+# Three numbers (r, g, b from 0 to 1) pin a fixed colour instead.
+icon_color = []
 """

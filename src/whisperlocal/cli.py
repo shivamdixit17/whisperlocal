@@ -5,6 +5,9 @@ WhisperLocal — command line entry point.
     whisperlocal doctor     check that everything is set up correctly
     whisperlocal config     create, locate or print your settings
     whisperlocal stats      summarise your dictation history
+    whisperlocal dashboard  open the analytics dashboard and settings page
+    whisperlocal api-key    store, check or remove the cloud transcription key
+    whisperlocal meetings   list, show, search and export recorded meetings
 
     whisperlocal install-app    install the menu bar app (starts at login)
     whisperlocal uninstall-app  remove it
@@ -30,6 +33,7 @@ PERMISSION_PANES = {
     "Accessibility": f"{PANE}?Privacy_Accessibility",
     "Microphone": f"{PANE}?Privacy_Microphone",
     "Input Monitoring": f"{PANE}?Privacy_ListenEvent",
+    "System Audio Recording": f"{PANE}?Privacy_AudioCapture",
 }
 
 OK = "OK  "
@@ -182,6 +186,54 @@ def _check_memory(settings: cfg.Settings) -> tuple[bool, str] | None:
     return None
 
 
+def _check_meetings(settings: cfg.Settings) -> list[tuple[bool, str]]:
+    """System-audio capture and the meetings folder."""
+    out: list[tuple[bool, str]] = []
+    if not settings.meeting_enabled:
+        out.append((True, "meetings: detection off (meeting_enabled = false)"))
+        return out
+    try:
+        from whisperlocal import systemaudio
+
+        ok, why = systemaudio.is_available()
+    except Exception as exc:  # pragma: no cover
+        ok, why = False, str(exc)
+    if ok:
+        out.append((True, "meetings: system-audio tap available (macOS asks the first time it is used)"))
+    else:
+        out.append((False, f"meetings: microphone only — {why}"))
+    root = settings.meeting_root
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        count = sum(1 for p in root.iterdir() if (p / "meeting.json").exists())
+        out.append((True, f"meetings: {count} recorded, in {root}"))
+    except OSError as exc:
+        out.append((False, f"meetings: cannot write {root}: {exc}"))
+    return out
+
+
+def _check_api(settings: cfg.Settings) -> list[tuple[bool, str]]:
+    """Only relevant once a backend is set to the cloud API."""
+    if not settings.uses_api:
+        return [(True, "backend: local (no network)")]
+    from whisperlocal import keychain
+
+    out = []
+    if keychain.has_api_key():
+        out.append((True, f"backend: api — key present, {settings.api_base_url} · {settings.api_model}"))
+    else:
+        out.append((False, "backend: api selected but no key — run: whisperlocal api-key set"))
+    try:
+        enc = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True, timeout=10)
+        if " aac " in enc.stdout:
+            out.append((True, "ffmpeg: aac encoder available for uploads"))
+        else:
+            out.append((False, "ffmpeg: no aac encoder — uploads will fail"))
+    except Exception:
+        pass
+    return out
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Run every check and summarize what, if anything, needs fixing."""
     print(f"WhisperLocal {__version__} — checking your setup\n")
@@ -218,6 +270,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     memory = _check_memory(settings)
     if memory:
         soft.append(memory)
+    soft.extend(_check_meetings(settings))
+    soft.extend(_check_api(settings))
     for ok, message in soft:
         print(f"[{OK if ok else WARN}] {message}")
 
@@ -233,9 +287,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"[{OK}] history: {kind}, {state}")
         print(f"        {hp}")
 
+    if settings.web_enabled:
+        print(f"[{OK}] dashboard: http://127.0.0.1:{settings.web_port} (open it from the menu bar)")
+
     print()
     print("These permissions belong to the app that launches WhisperLocal")
-    print("(your terminal, or whatever wrapper you use). Grant all three:")
+    print("(your terminal, or whatever wrapper you use). Grant them here:")
     for label, link in PERMISSION_PANES.items():
         print(f"   - {label:<17} {link}")
 
@@ -306,7 +363,227 @@ def cmd_stats(args: argparse.Namespace) -> int:
 
     settings = cfg.load()
     path = Path(args.file).expanduser() if args.file else None
+
+    if getattr(args, "json", False):
+        import json
+
+        from whisperlocal import analytics
+
+        source = path or settings.history_path
+        entries, skipped = stats.load_entries(source, args.days) if source.exists() else ([], 0)
+        data = analytics.build_dashboard(entries, days=args.days)
+        data["skipped"] = skipped
+        print(json.dumps(data, indent=2))
+        return 0
+
+    if getattr(args, "meetings", False):
+        import json
+
+        from whisperlocal.meetings import MeetingStore
+
+        data = MeetingStore(settings.meeting_root).stats(days=args.days)
+        print(json.dumps(data, indent=2))
+        return 0
+
     return stats.report(settings, days=args.days, show_text=args.text, path=path)
+
+
+# ─── dashboard ───────────────────────────────────────────────────────────────────
+
+
+class StandaloneContext:
+    """What the web layer sees when the menu bar app is not running.
+
+    Settings still save (they apply on the next launch); analytics and
+    meetings are read-only; anything that needs the live engine says so.
+    """
+
+    running = False
+
+    def __init__(self, settings_mgr):
+        from whisperlocal import keychain
+
+        self.settings = settings_mgr
+        self.version = __version__
+        self._keychain = keychain
+        self.recorder = None
+        try:
+            from whisperlocal.meetings import MeetingStore
+
+            self.meetings = MeetingStore(settings_mgr.current.meeting_root)
+        except Exception:
+            self.meetings = None
+
+    @property
+    def history_path(self):
+        return self.settings.current.history_path
+
+    def status(self) -> dict:
+        return {"running": False}
+
+    def _unsupported(self, *_args):
+        from whisperlocal.web.api import NotSupported
+
+        raise NotSupported("WhisperLocal is not running — start it to use this")
+
+    start_capture = capture_state = cancel_capture = request_restart = _unsupported
+
+    def api_key_set(self) -> bool:
+        return self._keychain.has_api_key()
+
+    def set_api_key(self, key: str) -> None:
+        self._keychain.set_api_key(key)
+
+    def clear_api_key(self) -> None:
+        self._keychain.clear_api_key()
+
+
+def _open_in_browser(url: str) -> None:
+    subprocess.Popen(["open", url])
+
+
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    """Open the dashboard: the running app's if there is one, else a standalone server."""
+    from whisperlocal.settings_manager import SettingsManager
+    from whisperlocal.web.server import WebConfig, WebServer, ping, read_discovery
+
+    tab = args.tab or "dashboard"
+    live = read_discovery()
+    if live and ping(live.get("url", "")):
+        url = f"{live['url'].rstrip('/')}/?token={live['token']}#{tab}"
+        print(f"WhisperLocal is running — opening {live['url']}")
+        if not args.no_browser:
+            _open_in_browser(url)
+        return 0
+
+    settings = cfg.load()
+    server = WebServer(StandaloneContext(SettingsManager(settings)), WebConfig(port=settings.web_port))
+    base = server.start()
+    print("WhisperLocal is not running; serving the dashboard on its own.")
+    print(f"   {base}")
+    print("   Settings saved here apply the next time the app starts. Ctrl-C to stop.")
+    if not args.no_browser:
+        _open_in_browser(server.url(tab))
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nStopped")
+    finally:
+        server.stop()
+    return 0
+
+
+# ─── api-key ─────────────────────────────────────────────────────────────────────
+
+
+def cmd_api_key(args: argparse.Namespace) -> int:
+    """Manage the cloud transcription key in the macOS Keychain."""
+    from whisperlocal import keychain
+
+    if args.action == "set":
+        import getpass
+
+        key = getpass.getpass("API key (input hidden): ").strip()
+        if not key:
+            print(f"[{FAIL}] Nothing entered.")
+            return 1
+        try:
+            keychain.set_api_key(key)
+        except keychain.KeychainError as exc:
+            print(f"[{FAIL}] {exc}")
+            return 1
+        print(f"[{OK}] Stored in the Keychain (service {keychain.SERVICE!r}).")
+        print("   Switch a backend to \"api\" in Settings to use it.")
+        return 0
+
+    if args.action == "clear":
+        keychain.clear_api_key()
+        print(f"[{OK}] Removed.")
+        return 0
+
+    if keychain.has_api_key():
+        source = "environment" if keychain.ENV_VAR in __import__("os").environ else "Keychain"
+        print(f"[{OK}] An API key is set ({source}).")
+    else:
+        print(f"[{WARN}] No API key. Store one with: whisperlocal api-key set")
+    settings = cfg.load()
+    print(f"   dictation_backend = {settings.dictation_backend}, meeting_backend = {settings.meeting_backend}")
+    print(f"   api_base_url = {settings.api_base_url}, api_model = {settings.api_model}")
+    return 0
+
+
+# ─── meetings ────────────────────────────────────────────────────────────────────
+
+
+def cmd_meetings(args: argparse.Namespace) -> int:
+    """Inspect recorded meetings from the terminal."""
+    from whisperlocal.meetings import MeetingStore
+
+    settings = cfg.load()
+    store = MeetingStore(settings.meeting_root)
+    action = args.action or "list"
+
+    if action == "list":
+        page = store.list(limit=args.limit, offset=0, days=args.days)
+        if not page["items"]:
+            print(f"No meetings yet in {settings.meeting_root}")
+            return 0
+        for m in page["items"]:
+            mins = (m.get("duration_s") or 0) / 60
+            print(
+                f"{m['id']}  {mins:5.1f} min  {m.get('words_total') or 0:6} words  "
+                f"{m.get('status'):12}  {m.get('title')}"
+            )
+        if page["total"] > len(page["items"]):
+            print(f"... {page['total'] - len(page['items'])} more (use --limit)")
+        return 0
+
+    if action == "search":
+        query = args.query or args.id
+        if not query:
+            print(f"[{FAIL}] Give the text to search for: whisperlocal meetings search budget")
+            return 2
+        hits = store.search(query, limit=args.limit)
+        if not hits:
+            print("No matches.")
+            return 0
+        for h in hits:
+            print(f"[{h['meeting_id']}] {h['start']:.0f}s {h['speaker']}: {h['snippet']}")
+        return 0
+
+    meeting_id = args.id
+    if not meeting_id:
+        print(f"[{FAIL}] A meeting id is required.")
+        return 2
+    if not store.exists(meeting_id):
+        print(f"[{FAIL}] No meeting {meeting_id!r}.")
+        return 1
+
+    if action == "show":
+        _, data, _ = store.export(meeting_id, "md")
+        print(data.decode("utf-8"))
+        return 0
+
+    if action == "export":
+        filename, data, _ = store.export(meeting_id, args.format)
+        out = Path(args.output) if args.output else Path.cwd() / filename
+        out.write_bytes(data)
+        print(f"[{OK}] Wrote {out}")
+        return 0
+
+    if action == "delete":
+        store.delete(meeting_id)
+        print(f"[{OK}] Deleted {meeting_id}.")
+        return 0
+
+    if action == "transcribe":
+        from whisperlocal.meetingrecorder import retranscribe
+
+        return retranscribe(store, meeting_id, settings, backend_name=args.backend)
+
+    print(f"[{FAIL}] Unknown action {action!r}.")
+    return 2
 
 
 # ─── app bundle ──────────────────────────────────────────────────────────────────
@@ -483,7 +760,32 @@ def build_parser() -> argparse.ArgumentParser:
     stats.add_argument("--days", type=int, help="only the last N days")
     stats.add_argument("--text", action="store_true", help="dump the transcripts too")
     stats.add_argument("--file", help="read a different history file")
+    stats.add_argument("--json", action="store_true", help="print the dashboard data as JSON")
+    stats.add_argument("--meetings", action="store_true", help="meeting statistics as JSON")
     stats.set_defaults(func=cmd_stats)
+
+    dashboard = sub.add_parser("dashboard", help="open the analytics dashboard and settings page")
+    dashboard.add_argument("--tab", choices=["dashboard", "settings", "meetings"])
+    dashboard.add_argument("--no-browser", action="store_true", help="print the URL only")
+    dashboard.set_defaults(func=cmd_dashboard)
+
+    api_key = sub.add_parser("api-key", help="manage the cloud transcription API key")
+    api_key.add_argument("action", nargs="?", choices=["status", "set", "clear"], default="status")
+    api_key.set_defaults(func=cmd_api_key)
+
+    meetings = sub.add_parser("meetings", help="list, show, search and export recorded meetings")
+    meetings.add_argument(
+        "action", nargs="?",
+        choices=["list", "show", "search", "export", "delete", "transcribe"], default="list",
+    )
+    meetings.add_argument("id", nargs="?", help="meeting id (from 'meetings list')")
+    meetings.add_argument("--query", help="text to search for (with 'search')")
+    meetings.add_argument("--format", choices=["md", "txt", "json"], default="md")
+    meetings.add_argument("--output", help="file to write (with 'export')")
+    meetings.add_argument("--days", type=int, help="only the last N days")
+    meetings.add_argument("--limit", type=int, default=50)
+    meetings.add_argument("--backend", choices=["local", "api"], help="for 'transcribe'")
+    meetings.set_defaults(func=cmd_meetings)
 
     install_app = sub.add_parser(
         "install-app", help="install the menu bar app so it starts at login"

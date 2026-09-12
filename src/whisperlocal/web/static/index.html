@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>WhisperLocal</title>
+<link rel="icon" href="/static/logo.svg" type="image/svg+xml">
+<link rel="icon" href="/static/favicon-64.png" sizes="64x64" type="image/png">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- Top bar: app name, tabs, live status pill -->
+<header class="topbar">
+  <div class="brand"><img class="brand-logo" src="/static/logo.svg" alt="" width="22" height="22">WhisperLocal <small id="version"></small></div>
+  <nav class="tabs" aria-label="Sections">
+    <a class="tab" href="#dashboard" data-tab="dashboard">Dashboard</a>
+    <a class="tab" href="#meetings" data-tab="meetings">Meetings</a>
+    <a class="tab" href="#settings" data-tab="settings">Settings</a>
+  </nav>
+  <div class="status-pill" id="status-pill" data-state="off" role="status" aria-live="polite">
+    <span class="dot" aria-hidden="true"></span>
+    <span id="status-text">Connecting…</span>
+  </div>
+</header>
+
+<main>
+  <!-- ─── Dashboard ─────────────────────────────────────────────────────── -->
+  <section class="view" id="view-dashboard" aria-labelledby="dash-title">
+    <div class="view-head">
+      <h2 id="dash-title">Dictation</h2>
+      <div class="filters" role="group" aria-label="Filters">
+        <div class="seg" id="range-seg" role="group" aria-label="Time range">
+          <button type="button" data-days="7" aria-pressed="false">7 d</button>
+          <button type="button" data-days="30" aria-pressed="true">30 d</button>
+          <button type="button" data-days="90" aria-pressed="false">90 d</button>
+          <button type="button" data-days="all" aria-pressed="false">All</button>
+        </div>
+        <label class="field-inline small" for="typing-wpm">Typing speed
+          <input type="number" id="typing-wpm" value="40" min="5" max="200" step="5"> wpm
+        </label>
+      </div>
+    </div>
+    <div id="dash-notice" hidden></div>
+    <div id="dash-body"></div>
+  </section>
+
+  <!-- ─── Meetings ──────────────────────────────────────────────────────── -->
+  <section class="view" id="view-meetings" aria-labelledby="meet-title">
+    <div class="view-head">
+      <h2 id="meet-title">Meetings</h2>
+      <span id="meet-live" class="small muted"></span>
+      <button type="button" class="btn record" id="meet-record">● Record</button>
+    </div>
+    <div id="meet-notice" hidden></div>
+    <div id="meet-body"></div>
+  </section>
+
+  <!-- ─── Settings ──────────────────────────────────────────────────────── -->
+  <section class="view" id="view-settings" aria-labelledby="set-title">
+    <div class="view-head">
+      <h2 id="set-title">Settings</h2>
+      <span id="set-path" class="small muted"></span>
+    </div>
+    <div id="set-error" class="notice error form-error" role="alert" hidden></div>
+    <div id="set-notice" hidden></div>
+    <form id="set-form" novalidate></form>
+  </section>
+</main>
+
+<!-- Sticky footer for unsaved settings -->
+<div class="savebar" id="savebar" hidden>
+  <strong id="savebar-count">0 unsaved changes</strong>
+  <span class="spacer"></span>
+  <button type="button" class="btn" id="discard-btn">Discard</button>
+  <button type="button" class="btn primary" id="save-btn">Save</button>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<div class="wall" id="wall" hidden>Open the dashboard from the WhisperLocal menu bar icon.</div>
+
+<script src="/static/vendor/chart.umd.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
