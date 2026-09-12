@@ -3,6 +3,12 @@
 All notable changes to WhisperLocal are recorded here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.3.1] — 2026-09-12
+
+- **Top terms spans the dashboard.** The card sat in the left half of a
+  two-column row with nothing beside it; it now takes the full width, so the
+  word and phrase lists have room instead of an empty box next to them.
+
 ## [1.3.0] — 2026-09-12
 
 Meetings get recorded and transcribed, the stats get a real dashboard and a
@@ -301,6 +307,7 @@ fixes below.
 - **Switching models could raise a `RuntimeError`** by renaming menu items while
   iterating the menu keyed by those names.
 
+[1.3.1]: https://github.com/shivamdixit17/whisperlocal/releases/tag/v1.3.1
 [1.3.0]: https://github.com/shivamdixit17/whisperlocal/releases/tag/v1.3.0
 [1.2.1]: https://github.com/shivamdixit17/whisperlocal/releases/tag/v1.2.1
 [1.2.0]: https://github.com/shivamdixit17/whisperlocal/releases/tag/v1.2.0

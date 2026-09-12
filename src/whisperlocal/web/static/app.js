@@ -494,7 +494,7 @@ const dashboard = {
   /* Top terms — sized list */
   cardTerms(d) {
     const t = d.terms || {};
-    const card = el('div', { class: 'card' }, [el('div', { class: 'card-head' }, [el('h3', { text: 'Top terms' })])]);
+    const card = el('div', { class: 'card span-2' }, [el('div', { class: 'card-head' }, [el('h3', { text: 'Top terms' })])]);
     if (!t.has_text) {
       card.append(el('p', { class: 'small muted', text: 'Words are not stored (History → “Store the words” is off), so there is nothing to count.' }));
       return card;
